@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
 
-from einops import rearrange
-
 
 class FrameAveraging(nn.Module):
     def __init__(self, dim=3, backward=False):
@@ -24,8 +22,8 @@ class FrameAveraging(nn.Module):
             accum.append(directions[dim_slice])
 
         accum = torch.broadcast_tensors(*accum)
-        operations = torch.stack(accum, dim = -1)
-        operations = rearrange(operations, '... d -> (...) d')
+        operations = torch.stack(accum, dim=-1)
+        operations = operations.reshape(-1, dim)
         return operations
 
     def create_frame(self, X, mask=None):
@@ -38,15 +36,16 @@ class FrameAveraging(nn.Module):
         X = X - center.unsqueeze(1) * mask  # [B,N,dim]
         X_ = X.masked_fill(~mask, 0.)
 
-        C = torch.bmm(X_.transpose(1,2), X_)  # [B,dim,dim] (Cov)
+        C = torch.bmm(X_.transpose(1, 2), X_)  # [B,dim,dim] (Cov)
         if not self.backward:
             C = C.detach()
 
         _, eigenvectors = torch.linalg.eigh(C, UPLO='U')  # [B,dim,dim]
-        F_ops = self.ops.unsqueeze(1).unsqueeze(0).to(X.device) * eigenvectors.unsqueeze(1)  # [1,2^dim,1,dim] x [B,1,dim,dim] -> [B,2^dim,dim,dim]
-        h = torch.einsum('boij,bpj->bopi', F_ops.transpose(2,3), X)  # transpose is inverse [B,2^dim,N,dim]
+        # [1,2^dim,1,dim] x [B,1,dim,dim] -> [B,2^dim,dim,dim]
+        F_ops = self.ops.unsqueeze(1).unsqueeze(0).to(X.device) * eigenvectors.unsqueeze(1)
+        h = torch.einsum('boij,bpj->bopi', F_ops.transpose(2, 3), X)  # transpose is inverse [B,2^dim,N,dim]
 
-        h = h.view(X.size(0) * self.n_frames, X.size(1), self.dim)
+        h = h.reshape(X.size(0) * self.n_frames, X.size(1), self.dim)
         return h, F_ops.detach(), center
 
     def invert_frame(self, X, mask, F_ops, center):

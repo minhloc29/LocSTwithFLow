@@ -2,6 +2,8 @@ import torch
 import numpy as np
 from scipy.stats import pearsonr
 
+from stflow.model.denoiser import HFlowDenoiser as Denoiser
+
 
 def metric_func(preds_all: np.ndarray, y_test: np.ndarray, genes: list):
     errors = []
@@ -64,10 +66,14 @@ def test(args, diffusier, model, loader_list, return_all=False):
                 0.01, 1.0, args.n_sample_steps
             )[:, None].expand(args.n_sample_steps, exp_t1.shape[0]).to(args.device)
 
+            # Hierarchy state is threaded across Euler steps.
+            # First call with hierarchy_state=None encodes from image.
+            hierarchy_state = None
+
             for step, (t1, t2) in enumerate(zip(ts[:-1], ts[1:])):
-                pred = model.inference(
-                    exp_t1, img_features, coords, 
-                    t1, predict=True
+                pred, hierarchy_state = model.inference(
+                    exp_t1, img_features, coords,
+                    t1, hierarchy_state=hierarchy_state,
                 )
                 d_t = t2 - t1
 

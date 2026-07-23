@@ -1,0 +1,6 @@
+README.md
+setup.py
+stflow.egg-info/PKG-INFO
+stflow.egg-info/SOURCES.txt
+stflow.egg-info/dependency_links.txt
+stflow.egg-info/top_level.txt

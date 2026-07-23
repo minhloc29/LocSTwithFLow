@@ -13,7 +13,8 @@ import torch
 from stflow.utils import set_random_seed, get_current_time, merge_fold_results
 from stflow.data.dataset import HESTDatasetPath, MultiHESTDataset, padding_batcher, HESTDataset
 from stflow.data.normalize_utils import get_normalize_method
-from stflow.model.denoiser import Denoiser
+from stflow.model.denoiser import HFlowDenoiser as Denoiser
+from stflow.model.hflow_config import HFlowConfig
 from stflow.flow.interpolant import Interpolant
 from stflow.app.flow.test import test
 from stflow.hest_utils.utils import save_pkl
@@ -59,7 +60,18 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
     ]
 
     device = args.device
-    model = Denoiser(args).to(device)
+
+    # Build HFlow config from args
+    hflow_config = HFlowConfig(
+        n_region_queries=args.n_region_queries,
+        region_hidden_dim=args.hidden_dim,
+        slide_hidden_dim=args.hidden_dim,
+        hflow_representation=args.hflow_representation,
+        hflow_dynamic_update=args.hflow_dynamic_update,
+        hflow_cross_scale=args.hflow_cross_scale,
+        hflow_region_discovery=args.hflow_region_discovery,
+    )
+    model = Denoiser(args, hflow_config=hflow_config).to(device)
 
     diffusier = Interpolant(
         args.prior_sampler, 
@@ -219,6 +231,20 @@ if __name__ == '__main__':
     parser.add_argument('--feature_dim', type=int, default=1024, help="uni:1024, ciga:512")
     parser.add_argument('--norm', type=str, default='layer', help="batch | layer")
     parser.add_argument('--activation', type=str, default='swiglu', help="relu | gelu | swiglu")
+
+    # hierarchical flow matching hyperparameters (HFlow-ST)
+    parser.add_argument('--hflow_representation', type=str, default='slide_region_patch',
+                        help="flat | slide_patch | slide_region_patch")
+    parser.add_argument('--hflow_dynamic_update', action='store_true', default=True,
+                        help="Update hierarchy at every flow step")
+    parser.add_argument('--hflow_no_dynamic_update', dest='hflow_dynamic_update', action='store_false',
+                        help="Keep hierarchy fixed during flow")
+    parser.add_argument('--hflow_cross_scale', type=str, default='bidirectional',
+                        help="none | top_down | bottom_up | bidirectional")
+    parser.add_argument('--hflow_region_discovery', type=str, default='learnable',
+                        help="learnable | grid | kmeans")
+    parser.add_argument('--n_region_queries', type=int, default=16,
+                        help="Number of learnable region tokens")
     args = parser.parse_args()
 
     args.feature_dim = {
