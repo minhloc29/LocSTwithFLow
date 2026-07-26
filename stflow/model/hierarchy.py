@@ -33,87 +33,24 @@ def _get_sincos_pos_embed(embed_dim, coords):
 
 class RegionCrossAttention(nn.Module):
     """
-    Learnable region queries attend to patch tokens.
+    Lightweight learnable region prototype initializer.
 
-    Uses spatially-aware cross-attention: patch tokens carry coordinate
-    positional encodings, so region queries can learn spatial structure.
+    This keeps the initial hierarchy cheap: regions start as learnable
+    prototypes and are then refined by the dynamic assignment mechanism in
+    HFlowBlock.
     """
 
-    def __init__(self, d_model, n_queries, n_heads=4, dropout=0.1, pos_embed_dim=64):
+    def __init__(self, d_model, n_queries, **kwargs):
         super().__init__()
-        self.d_model = d_model
         self.n_queries = n_queries
-        self.pos_embed_dim = min(pos_embed_dim, d_model)
-
-        # Learnable region queries [1, n_queries, d_model]
         self.region_queries = nn.Parameter(torch.randn(1, n_queries, d_model) * 0.02)
 
-        # Cross-attention: region (Q) ← patches (K, V)
-        self.cross_attn = nn.MultiheadAttention(
-            d_model, n_heads, dropout=dropout, batch_first=True
-        )
-        self.norm = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model),
-            nn.Dropout(dropout),
-        )
-        self.norm2 = nn.LayerNorm(d_model)
-
-        # Optional projection if pos_embed_dim < d_model
-        self.pos_proj = nn.Linear(pos_embed_dim, d_model) if pos_embed_dim != d_model else nn.Identity()
-
     def forward(self, patch_embs, coords, pad_mask=None, return_weights=False):
-        """
-        Args:
-            patch_embs:  [B, N, d_model]  patch tokens
-            coords:      [B, N, 2]        spatial coordinates
-            pad_mask:    [B, N]           True = padding
-            return_weights: bool          return attention weights for visualization
-
-        Returns:
-            region_embs: [B, K, d_model]
-            attn_weights: [B, H, K, N]  (if return_weights)
-        """
-        B, N, D = patch_embs.shape
-        K = self.n_queries
-
-        # Add positional encoding to patch tokens
-        # Normalize coords within each slide
-        coord_min = coords.min(dim=1, keepdim=True)[0]
-        coord_max = coords.max(dim=1, keepdim=True)[0]
-        norm_coords = (coords - coord_min) / (coord_max - coord_min + 1e-8) * 2 - 1  # [-1, 1]
-
-        pos_embed = _get_sincos_pos_embed(self.pos_embed_dim, norm_coords.reshape(-1, 2))
-        pos_embed = pos_embed.reshape(B, N, self.pos_embed_dim).to(patch_embs.device)
-        pos_embed = self.pos_proj(pos_embed)
-
-        patch_with_pos = patch_embs + pos_embed
-
-        # Expand region queries to batch
-        region_queries = self.region_queries.expand(B, -1, -1)  # [B, K, D]
-
-        # Cross-attention: region ← patches
-        # key_padding_mask: True means *ignore* that position
-        attn_mask = None
-        if pad_mask is not None:
-            attn_mask = pad_mask  # [B, N]
-
-        attn_out, attn_weights = self.cross_attn(
-            region_queries, patch_with_pos, patch_with_pos,
-            key_padding_mask=attn_mask,
-            need_weights=return_weights,
-            average_attn_weights=False,  # [B, H, K, N] when return_weights
-        )
-
-        # Pre-norm residual
-        region_embs = self.norm(region_queries + attn_out)
-        region_embs = self.norm2(region_embs + self.ffn(region_embs))
-
+        del coords, pad_mask
+        batch_size = patch_embs.shape[0]
+        region_embs = self.region_queries.expand(batch_size, -1, -1)
         if return_weights:
-            return region_embs, attn_weights
+            return region_embs, None
         return region_embs
 
 
@@ -171,10 +108,8 @@ class GridRegionDiscovery(nn.Module):
 
         return region_embs
 
-
 class KMeansRegionDiscovery(nn.Module):
     """
-    K-means soft assignment for region discovery.
     Learns K centroid embeddings; patches are softly assigned via attention
     to centroids based on spatial proximity + feature similarity.
     """

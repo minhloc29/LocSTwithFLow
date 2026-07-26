@@ -5,6 +5,10 @@ Central novelty: hierarchy state (z_slide, z_region, z_patch) persists across
 flow timesteps, not just across internal transformer layers.  This means the
 biological representation of the slide evolves jointly with the generative
 process, exactly as described in the HFlow-ST proposal.
+
+[PATCHED] After the HFlowBlock loop, exposes `_last_region_assignment` and
+`_all_block_region_assignments` on the denoiser (only during eval), read
+externally by test_with_diagnostics.py.
 """
 
 import math
@@ -17,10 +21,6 @@ from stflow.model.hflow_block import HFlowBlock
 
 
 class TimestepEmbedder(nn.Module):
-    """
-    Sinusoidal timestep embedding with an MLP projection.
-    (Identical to original STFlow implementation.)
-    """
 
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
@@ -109,6 +109,10 @@ class HFlowDenoiser(nn.Module):
 
         self.loss_func = nn.MSELoss()
 
+        # ── DIAGNOSTIC CAPTURE (init) ──
+        self._last_region_assignment = None
+        self._all_block_region_assignments = None
+
     # ── helpers ────────────────────────────────────────────────────────
 
     def _build_graph(self, coords_flat, batch_idx, n_neighbors, exclude_self=True):
@@ -134,7 +138,9 @@ class HFlowDenoiser(nn.Module):
         if self.representation in ("slide_patch", "slide_region_patch"):
             patch_embs = self.image_transform(img_features)          # [B, N, d_model]
             z_patch, z_region, z_slide = self.hierarchy_encoder(
-                patch_embs, coords, pad_mask=pad_mask
+                patch_embs,
+                coords,
+                pad_mask=pad_mask,
             )
             # slide_patch mode: no real regions; use slide as a single region
             if self.representation == "slide_patch":
@@ -184,6 +190,7 @@ class HFlowDenoiser(nn.Module):
         """
         B, N_cells, _ = noisy_exp.shape
         device = noisy_exp.device
+        self._last_assignment_entropy = None
 
         pad_mask, batch_idx, noisy_exp_flat, coords_flat = self._prepare_flat_inputs(
             noisy_exp, img_features, coords
@@ -194,7 +201,9 @@ class HFlowDenoiser(nn.Module):
         if hierarchy_state is None:
             # First call at this flow step: encode from image
             z_patch, z_region, z_slide = self._build_hierarchy(
-                img_features, coords, pad_mask
+                img_features,
+                coords,
+                pad_mask,
             )
             # Add time embedding — only once (it becomes part of the state)
             t_emb_batch = t_emb[:, None, :].expand(B, N_cells, -1)
@@ -216,6 +225,7 @@ class HFlowDenoiser(nn.Module):
         curr_z_patch = z_patch_flat
         curr_z_region = z_region
         curr_z_slide = z_slide
+        block_velocities = []
 
         for block in self.blocks:
             if self.dynamic_update:
@@ -238,10 +248,11 @@ class HFlowDenoiser(nn.Module):
                 pad_mask=pad_mask,
                 max_n_cells=N_cells,
             )
+            block_velocities.append(velocity_flat)
 
-        # Use last block's velocity (not averaged — see ablation note)
-        prediction_flat = velocity_flat
-
+        # Average every block's prediction so each block receives direct supervision.
+        prediction_flat = torch.stack(block_velocities).mean(0)
+        # prediction_flat = block_velocities[0]
         # Convert back to batched form
         prediction = prediction_flat.new_zeros(B, N_cells, prediction_flat.shape[-1])
         prediction[~pad_mask] = prediction_flat
@@ -251,6 +262,16 @@ class HFlowDenoiser(nn.Module):
         z_patch_updated = z_patch.new_zeros(B, N_cells, self.d_model)
         z_patch_updated[~pad_mask] = curr_z_patch
         new_hierarchy_state = (z_patch_updated, curr_z_region, curr_z_slide)
+
+        # ── DIAGNOSTIC CAPTURE (after block loop) ──
+        # Uses the LAST block's region assignment as the "final" regional read-out
+        # for this Euler step. Also keeps all 4 blocks' assignments for optional
+        # per-block consistency analysis (Tier-2 metric).
+        if not self.training:
+            self._last_region_assignment = self.blocks[-1]._last_region_assignment
+            self._all_block_region_assignments = [
+                b._last_region_assignment for b in self.blocks
+            ]
 
         return prediction, new_hierarchy_state
 

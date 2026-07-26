@@ -1,6 +1,5 @@
 import os
 import json
-import wandb
 import argparse
 import numpy as np
 import pandas as pd
@@ -9,6 +8,11 @@ from tqdm import tqdm
 from operator import itemgetter
 
 import torch
+
+try:
+    import wandb
+except ModuleNotFoundError:
+    wandb = None
 
 from stflow.utils import set_random_seed, get_current_time, merge_fold_results
 from stflow.data.dataset import HESTDatasetPath, MultiHESTDataset, padding_batcher, HESTDataset
@@ -70,6 +74,8 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
         hflow_dynamic_update=args.hflow_dynamic_update,
         hflow_cross_scale=args.hflow_cross_scale,
         hflow_region_discovery=args.hflow_region_discovery,
+        hflow_assignment_temperature=args.hflow_assignment_temperature,
+        hflow_assignment_entropy_weight=args.hflow_assignment_entropy_weight,
     )
     model = Denoiser(args, hflow_config=hflow_config).to(device)
 
@@ -109,7 +115,7 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
             optimizer.step()
 
-            if args.use_wandb:
+            if args.use_wandb and wandb is not None:
                 wandb.log({f"{args.dataset}/Train/{split_id}/loss": loss.cpu().item()})
 
             avg_loss += loss.cpu().item()
@@ -134,11 +140,11 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
 
             else:
                 early_stop_step += 1
-                if early_stop_step >= 20:
+                if early_stop_step >= 100:
                     print("Early stopping")
                     break
 
-            if args.use_wandb:
+            if args.use_wandb and wandb is not None:
                 for patch_name, dataset_res in val_perf_dict.items():
                     wandb.log({
                         f"{args.dataset}/Val/{split_id}/{patch_name}/pearson_mean": dataset_res['pearson_mean'],
@@ -188,12 +194,12 @@ def run(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', type=int, default=1)
-    parser.add_argument('--datasets', nargs='+', default=["all"], help="LUNG, READ, HCC")
-    parser.add_argument('--use_wandb', default=False)
+    parser.add_argument('--datasets', nargs='+', default=["all"], help="LUNG, READ, HCC, COAD")
+    parser.add_argument('--use_wandb', default=True)
     parser.add_argument('--source_dataroot', default="/home/username/Anonymous_STFlow/dataset/")
     parser.add_argument('--embed_dataroot', type=str, default="/home/username/Anonymous_STFlow/dataset/embed_dataroot")
     parser.add_argument('--gene_list', type=str, default='var_50genes.json')
-    parser.add_argument('--save_dir', type=str, default="/home/username/Anonymous_STFlow/results_dir/")
+    parser.add_argument('--save_dir', type=str, default="results_dir/")
     parser.add_argument('--feature_encoder', type=str, default='uni_v1_official', help="uni_v1_official | resnet50_trunc | ciga | gigapath")
     parser.add_argument('--normalize_method', type=str, default="log1p")
     parser.add_argument('--exp_code', type=str, default="test")
@@ -203,7 +209,7 @@ if __name__ == '__main__':
     parser.add_argument('--sample_times', type=int, default=10, help='Number of times to sample patches from each image')
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size')
     parser.add_argument('--lr', type=float, default=5e-4)
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--clip_norm', type=float, default=1.)
     parser.add_argument('--save_step', type=int, default=-1)
     parser.add_argument('--eval_step', type=int, default=1)
@@ -242,10 +248,20 @@ if __name__ == '__main__':
     parser.add_argument('--hflow_cross_scale', type=str, default='bidirectional',
                         help="none | top_down | bottom_up | bidirectional")
     parser.add_argument('--hflow_region_discovery', type=str, default='learnable',
-                        help="learnable | grid | kmeans")
-    parser.add_argument('--n_region_queries', type=int, default=16,
+                        help="learnable | grid | kmeans | assignment")
+    parser.add_argument('--n_region_queries', type=int, default=32,
                         help="Number of learnable region tokens")
+    parser.add_argument('--hflow_assignment_temperature', type=float, default=1.0,
+                        help="Temperature for dynamic region assignments")
+    parser.add_argument('--hflow_assignment_entropy_weight', type=float, default=0.1,
+                        help="Entropy regularization weight for dynamic assignments")
     args = parser.parse_args()
+
+    # HFlowDenoiser expects the model width under d_model; keep the CLI's
+    # hidden_dim as the single source of truth and expose it under both names.
+    args.d_model = args.hidden_dim
+    args.d_edge_model = args.pairwise_hidden_dim
+    args.act = args.activation
 
     args.feature_dim = {
         "uni_v1_official": 1024,
@@ -256,13 +272,13 @@ if __name__ == '__main__':
     set_random_seed(args.seed)
 
     if args.exp_code is None:
-        exp_code = f"{args.backbone}::{get_current_time()}"
+        exp_code = f"{args.backbone}_{get_current_time()}"
     else:
-        exp_code = args.exp_code + f"_{args.feature_encoder}" + f"_{args.backbone}::{get_current_time()}"
+        exp_code = args.exp_code + f"_{args.feature_encoder}" + f"_{args.backbone}_{get_current_time()}"
     save_dir = os.path.join(args.save_dir, exp_code)
     os.makedirs(save_dir, exist_ok=True)
     
-    if args.use_wandb:
+    if args.use_wandb and wandb is not None:
         wandb.init(project="spatial_transcriptomics", name=exp_code)
         wandb.config.update(args)
 
@@ -282,5 +298,5 @@ if __name__ == '__main__':
 
         run(args)
 
-    if args.use_wandb:
+    if args.use_wandb and wandb is not None:
         wandb.finish()

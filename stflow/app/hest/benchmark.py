@@ -264,7 +264,7 @@ if __name__ == "__main__":
     if args.exp_code is None:
         exp_code = f"run_{get_current_time()}"
     else:
-        exp_code = args.exp_code + f"::{get_current_time()}"
+        exp_code = args.exp_code + f"_{get_current_time()}"
     save_dir = os.path.join(save_dir, exp_code)
     os.makedirs(save_dir, exist_ok=True)
 

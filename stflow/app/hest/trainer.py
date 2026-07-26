@@ -19,7 +19,7 @@ def train_test_reg(X_train, X_test, y_train, y_test,
         preds_all = reg.predict(X_test)
 
     elif method == 'random-forest':
-        from cuml.ensemble import RandomForestRegressor
+        from sklearn.ensemble import RandomForestRegressor
     
         def train_regressor(X, y_column, i):
             # print('fitting model ', i)

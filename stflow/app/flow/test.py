@@ -1,8 +1,28 @@
+"""
+Drop-in replacement for stflow/app/flow/test.py's `test()` function.
+
+Adds, on top of the original PCC/R2/L2 metrics:
+  - per-slide coordinates (needed for Moran's I — spatial autocorrelation
+    is only meaningful within a slide, not pooled across slides)
+  - slide_id per spot (so downstream analysis can group correctly)
+  - region assignment matrices per spot (needed for region-tissue
+    correspondence / ARI-NMI). Requires the small patch in
+    patch_capture_diagnostics.py to be applied first, so the model
+    exposes `_last_region_assignment` after each inference() call.
+    If you haven't applied that patch yet, this still works — region
+    fields will just be None / skipped.
+
+Usage is identical to before:
+    res_dict, dump = test(args, diffusier, model, val_loaders, return_all=True)
+    # dump now also has 'coords_all', 'slide_id_all', 'region_assignments_all'
+
+Save the dump with save_pkl(...) once per trained checkpoint (flat, static,
+dynamic) so the analysis script can load and compare them offline.
+"""
+
 import torch
 import numpy as np
 from scipy.stats import pearsonr
-
-from stflow.model.denoiser import HFlowDenoiser as Denoiser
 
 
 def metric_func(preds_all: np.ndarray, y_test: np.ndarray, genes: list):
@@ -10,7 +30,7 @@ def metric_func(preds_all: np.ndarray, y_test: np.ndarray, genes: list):
     r2_scores = []
     pearson_corrs = []
     pearson_genes = []
-    
+
     n_nan_genes = 0
     for i, target in enumerate(range(y_test.shape[1])):
         preds = preds_all[:, target]
@@ -19,42 +39,42 @@ def metric_func(preds_all: np.ndarray, y_test: np.ndarray, genes: list):
         errors.append(float(np.mean((preds - target_vals) ** 2)))
         r2_scores.append(float(1 - np.sum((target_vals - preds) ** 2) / np.sum((target_vals - np.mean(target_vals)) ** 2)))
         pearson_corr, _ = pearsonr(target_vals, preds)
+        pearson_corr = float(pearson_corr)
         pearson_corrs.append(pearson_corr)
 
         if np.isnan(pearson_corr):
             n_nan_genes += 1
 
-        score_dict = {
-            'name': genes[i],
-            'pearson_corr': pearson_corr,
-        }
-        pearson_genes.append(score_dict)
+        pearson_genes.append({'name': genes[i], 'pearson_corr': pearson_corr})
 
     if n_nan_genes > 0:
         print(f"Warning: {n_nan_genes} genes have NaN Pearson correlation")
 
-    return {'l2_errors': list(errors), 
-            'r2_scores': list(r2_scores),
-            'pearson_corrs': pearson_genes,
-            'pearson_mean': float(np.mean(pearson_corrs)),
-            'pearson_std': float(np.std(pearson_corrs)),
-            'l2_error_q1': float(np.percentile(errors, 25)),
-            'l2_error_q2': float(np.median(errors)),
-            'l2_error_q3': float(np.percentile(errors, 75)),
-            'r2_score_q1': float(np.percentile(r2_scores, 25)),
-            'r2_score_q2': float(np.median(r2_scores)),
-            'r2_score_q3': float(np.percentile(r2_scores, 75))
-        }
+    return {
+        'l2_errors': list(errors),
+        'r2_scores': list(r2_scores),
+        'pearson_corrs': pearson_genes,
+        'pearson_mean': float(np.mean(pearson_corrs)),
+        'pearson_std': float(np.std(pearson_corrs)),
+        'l2_error_q1': float(np.percentile(errors, 25)),
+        'l2_error_q2': float(np.median(errors)),
+        'l2_error_q3': float(np.percentile(errors, 75)),
+        'r2_score_q1': float(np.percentile(r2_scores, 25)),
+        'r2_score_q2': float(np.median(r2_scores)),
+        'r2_score_q3': float(np.percentile(r2_scores, 75)),
+    }
 
 
 @torch.no_grad()
 def test(args, diffusier, model, loader_list, return_all=False):
     model.eval()
     all_pred, all_gt = [], []
+    all_coords, all_slide_id, all_region_assign = [], [], []
     res_dict = {}
+    capture_regions = hasattr(model, '_last_region_assignment') or True  # try regardless; guarded below
 
     for loader in loader_list:
-        cur_pred, cur_gt = [], []
+        cur_pred, cur_gt, cur_coords, cur_region = [], [], [], []
 
         for step, batch in enumerate(loader):
             batch = [x.to(args.device) for x in batch]
@@ -66,9 +86,8 @@ def test(args, diffusier, model, loader_list, return_all=False):
                 0.01, 1.0, args.n_sample_steps
             )[:, None].expand(args.n_sample_steps, exp_t1.shape[0]).to(args.device)
 
-            # Hierarchy state is threaded across Euler steps.
-            # First call with hierarchy_state=None encodes from image.
             hierarchy_state = None
+            pred = None
 
             for step, (t1, t2) in enumerate(zip(ts[:-1], ts[1:])):
                 pred, hierarchy_state = model.inference(
@@ -85,23 +104,56 @@ def test(args, diffusier, model, loader_list, return_all=False):
             sample = pred
             cur_pred.append(sample.squeeze(0).cpu().numpy())
             cur_gt.append(labels.squeeze(0).cpu().numpy())
-        
-        # test the performance on each dataset
+            cur_coords.append(coords.squeeze(0).cpu().numpy())
+
+            # Region assignment from the FINAL Euler step's forward pass.
+            # Shape as produced by DynamicRegionAssignment: [B=1, N, K] -> squeeze to [N, K]
+            region_assign = getattr(model, '_last_region_assignment', None)
+            if region_assign is not None:
+                cur_region.append(region_assign.squeeze(0).cpu().numpy())
+            else:
+                cur_region.append(None)
+
         cur_pred = np.concatenate(cur_pred, axis=0)
         cur_gt = np.concatenate(cur_gt, axis=0)
-        cur_res_dict = metric_func(cur_pred, cur_gt, loader.dataset.gene_list)        
+        cur_coords_arr = np.concatenate(cur_coords, axis=0)
+        cur_res_dict = metric_func(cur_pred, cur_gt, loader.dataset.gene_list)
         cur_res_dict.update({'n_test': len(cur_gt)})
         res_dict[loader.dataset.name] = cur_res_dict
 
         all_pred.append(cur_pred)
         all_gt.append(cur_gt)
-    
-    # test the performance on all datasets
+        all_coords.append(cur_coords_arr)
+        all_slide_id.append(np.full(len(cur_gt), loader.dataset.name, dtype=object))
+
+        if all(r is not None for r in cur_region):
+            all_region_assign.append(np.concatenate(cur_region, axis=0))
+        else:
+            all_region_assign.append(None)
+
     all_pred = np.concatenate(all_pred, axis=0)
     all_gt = np.concatenate(all_gt, axis=0)
+    all_slide_id_flat = np.concatenate(all_slide_id, axis=0)
+    all_coords_flat = np.concatenate(all_coords, axis=0)
+
     cur_res_dict = metric_func(all_pred, all_gt, loader_list[0].dataset.gene_list)
     cur_res_dict.update({'n_test': len(all_gt)})
     res_dict["all"] = cur_res_dict
+
     if return_all:
-        return res_dict, {'preds_all': all_pred, 'targets_all': all_gt}
+        dump = {
+            'preds_all': all_pred,
+            'targets_all': all_gt,
+            'coords_all': all_coords_flat,
+            'slide_id_all': all_slide_id_flat,
+            'gene_list': loader_list[0].dataset.gene_list,
+        }
+        if all(r is not None for r in all_region_assign):
+            dump['region_assignments_all'] = np.concatenate(all_region_assign, axis=0)
+        else:
+            dump['region_assignments_all'] = None
+            print("Note: region_assignments not captured — apply patch_capture_diagnostics.py first "
+                  "if you want the region-tissue correspondence analysis.")
+        return res_dict, dump
+
     return res_dict

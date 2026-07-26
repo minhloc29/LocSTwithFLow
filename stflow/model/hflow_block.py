@@ -1,18 +1,15 @@
 """
 HFlowBlock — The core building block of the Hierarchical Biological Flow Transformer.
+
+[PATCHED] Adds capture of region_assignment / pad_mask for offline diagnostics
+(Moran's I subset analysis, region-tissue correspondence ARI/NMI). See the two
+blocks marked "# ── DIAGNOSTIC CAPTURE ──" below.
 """
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from stflow.model.cross_scale import (
-    SlideToRegionAttention,
-    RegionToPatchAttention,
-    PatchToRegionAttention,
-    RegionToSlideAttention,
-)
 from stflow.model.fa import FrameAveraging
 
 
@@ -33,6 +30,77 @@ def einsum(*operands_and_equation):
     """Minimal einops.einsum: last arg is equation string, rest are tensors."""
     *operands, equation = operands_and_equation
     return torch.einsum(equation, operands)
+
+
+def gru_update(cell, hidden, candidate):
+    """Apply a GRUCell over batched sequence/state tensors."""
+    hidden_shape = hidden.shape
+    updated = cell(candidate.reshape(-1, candidate.shape[-1]), hidden.reshape(-1, hidden.shape[-1]))
+    return updated.reshape(hidden_shape)
+
+
+class DynamicRegionAssignment(nn.Module):
+    """
+    Recompute patch-to-region assignments from the current patch state and
+    current gene context, then update region/slide memory recurrently.
+    """
+
+    def __init__(self, d_model, gene_dim, drop=0.0):
+        super().__init__()
+        self.gene_proj = nn.Sequential(
+            nn.Linear(gene_dim, d_model),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(d_model, d_model),
+        )
+        self.region_gate = nn.Sequential(
+            nn.Linear(d_model * 3, d_model),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(d_model, d_model),
+        )
+        self.slide_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(d_model, d_model),
+        )
+        
+        self.region_gru = nn.GRUCell(d_model, d_model)
+        self.slide_gru = nn.GRUCell(d_model, d_model)
+
+    def forward(self, patch_batch, region_state, slide_state, gene_context_batch, pad_mask=None):
+        gene_state = self.gene_proj(gene_context_batch)
+        if pad_mask is None:
+            gene_summary = gene_state.mean(dim=1, keepdim=True)
+        else:
+            valid_mask = (~pad_mask).unsqueeze(-1).to(dtype=gene_state.dtype)
+            gene_summary = (gene_state * valid_mask).sum(dim=1, keepdim=True) / valid_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+
+        patch_query = patch_batch + gene_state
+        region_key = region_state + gene_summary.expand_as(region_state)
+        scores = torch.matmul(patch_query, region_key.transpose(-1, -2)) / math.sqrt(patch_batch.shape[-1])
+
+        if pad_mask is not None:
+            scores = scores.masked_fill(pad_mask.unsqueeze(-1), -1e9)
+
+        assignment = F.softmax(scores, dim=-1)
+        if pad_mask is not None:
+            assignment = assignment * (~pad_mask).unsqueeze(-1).to(dtype=assignment.dtype)
+
+        region_mass = assignment.sum(dim=1).clamp_min(1e-6)
+        region_candidate = torch.einsum("bnk,bnd->bkd", assignment, patch_batch)
+        region_candidate = region_candidate / region_mass.unsqueeze(-1)
+        region_candidate = region_candidate + self.region_gate(
+            torch.cat([region_candidate, region_state, gene_summary.expand_as(region_candidate)], dim=-1)
+        )
+
+        region_state = gru_update(self.region_gru, region_state, region_candidate)
+        slide_candidate = region_state.mean(dim=1, keepdim=True)
+        slide_candidate = slide_candidate + self.slide_gate(torch.cat([slide_candidate, gene_summary], dim=-1))
+        slide_state = gru_update(self.slide_gru, slide_state, slide_candidate)
+
+        return region_state, slide_state, assignment
 
 
 def to_dense_batch(x, batch, fill_value=0, max_num_nodes=None):
@@ -57,25 +125,13 @@ def to_dense_batch(x, batch, fill_value=0, max_num_nodes=None):
     out = torch.full((B, max_num_nodes, D), fill_value, dtype=x.dtype, device=x.device)
     valid_mask = torch.zeros(B, max_num_nodes, dtype=torch.bool, device=x.device)
 
-    # Build flat indices: for each element, compute its row and column within [B, N_max]
-    arange = torch.arange(N_total, device=batch.device)
-    per_sample_counts = torch.zeros(B, dtype=torch.long, device=batch.device)
-    # positions within each sample: use scatter_add of ones to get cumulative count per batch
-    ones = torch.ones(N_total, dtype=torch.long, device=batch.device)
-    pos_per_sample = torch.zeros(N_total, dtype=torch.long, device=batch.device)
-    per_sample_counts.scatter_add_(0, batch, ones)
-    offsets = torch.zeros(B, dtype=torch.long, device=batch.device)
-    offsets[1:] = per_sample_counts.cumsum(0)[:-1]
-
-    # Assign positions: for each batch element, positions are 0, 1, 2, ... sequentially
-    # Use a simple segmented arange via exclusive scan
-    pos = torch.zeros(N_total, dtype=torch.long, device=batch.device)
-    # Compute cumulative count within each batch group
-    # Simple approach: do one pass with scatter_add for counting
-    for b in range(B):
-        mask_b = batch == b
-        n_b = mask_b.sum().item()
-        pos[mask_b] = torch.arange(n_b, device=batch.device)
+    order = torch.argsort(batch, stable=True)
+    batch_sorted = batch[order]
+    counts = torch.bincount(batch_sorted, minlength=B)
+    starts = torch.cumsum(counts, dim=0) - counts
+    pos_sorted = torch.arange(N_total, device=batch.device) - starts[batch_sorted]
+    pos = torch.empty_like(pos_sorted)
+    pos[order] = pos_sorted
 
     out[batch, pos] = x
     valid_mask[batch, pos] = True
@@ -235,6 +291,21 @@ class HFlowBlock(nn.Module):
         self.spatial_norm = nn.LayerNorm(d_model)
         self.spatial_norm2 = nn.LayerNorm(d_model)
 
+        self.flow_context_proj = nn.Sequential(
+            nn.Linear(n_genes, d_model),
+            nn.GELU(),
+            nn.Dropout(proj_drop),
+            nn.Linear(d_model, d_model),
+        )
+
+        self.flow_context_gate = nn.Parameter(torch.tensor(-2.1972246))
+        self.velocity_gate = nn.Parameter(torch.tensor(-2.1972246))
+        self.region_norm = nn.LayerNorm(d_model)
+        self.slide_norm = nn.LayerNorm(d_model)
+        self.region_gru = nn.GRUCell(d_model, d_model)
+        self.slide_gru = nn.GRUCell(d_model, d_model)
+        self.dynamic_assignment = DynamicRegionAssignment(d_model, d_model, drop=proj_drop)
+
         # ── 2. Gene velocity head (last block's prediction is used) ──
         self.velocity_head = nn.Sequential(
             nn.Linear(d_model, d_model),
@@ -245,13 +316,14 @@ class HFlowBlock(nn.Module):
             nn.Dropout(proj_drop),
         )
 
-        # ── 3. Cross-scale modules ──
-        self.patch_to_region = PatchToRegionAttention(d_model, n_heads, attn_drop)
-        self.region_to_slide = RegionToSlideAttention(d_model, n_heads, attn_drop)
-        self.slide_to_region = SlideToRegionAttention(d_model, n_heads, attn_drop)
-        self.region_to_patch = RegionToPatchAttention(d_model, n_heads, attn_drop)
-
         self.cross_scale_direction = hflow_cross_scale
+
+        # ── DIAGNOSTIC CAPTURE (init) ──
+        # Populated during eval-mode forward passes; read externally by
+        # test_with_diagnostics.py via `model.blocks[-1]._last_region_assignment`
+        # (or `model._last_region_assignment`, set on the denoiser after the loop).
+        self._last_region_assignment = None
+        self._last_pad_mask = None
 
     def forward(
         self,
@@ -286,6 +358,8 @@ class HFlowBlock(nn.Module):
         B = z_region.shape[0]
         N_total = z_patch_flat.shape[0]
         direction = self.cross_scale_direction
+        initial_patch = z_patch_flat
+        gene_context = self.flow_context_proj(noisy_exp_flat)
 
         # ── Step 1: Spatial patch self-attention (k-NN graph) ──
         attn_out = self.spatial_attn(
@@ -294,36 +368,63 @@ class HFlowBlock(nn.Module):
         z_patch_flat = self.spatial_norm(z_patch_flat + attn_out)
         z_patch_flat = self.spatial_norm2(z_patch_flat + self.spatial_mlp(z_patch_flat))
 
-        # ── Cross-scale message passing ──
-        if direction in ("bottom_up", "bidirectional", "top_down"):
-            # Convert flat → batched [B, N_max, D]
-            if pad_mask is None:
-                z_patch_batch, valid_mask = to_dense_batch(
-                    z_patch_flat, batch=batch_idx, fill_value=0.0,
-                    max_num_nodes=max_n_cells,
-                )
-                pad_mask_for_attn = ~valid_mask  # True = padding for attention
+        # Keep the current noisy expression visible to the hierarchy.
+        flow_alpha = torch.sigmoid(self.flow_context_gate)
+        z_patch_flat = z_patch_flat + flow_alpha * gene_context
+
+        # Recompute the hierarchy from the current post-attention patch state.
+        if pad_mask is None:
+            z_patch_batch, valid_mask = to_dense_batch(
+                z_patch_flat,
+                batch=batch_idx,
+                fill_value=0.0,
+                max_num_nodes=max_n_cells,
+            )
+            gene_context_batch, _ = to_dense_batch(
+                gene_context,
+                batch=batch_idx,
+                fill_value=0.0,
+                max_num_nodes=max_n_cells,
+            )
+            pad_mask_for_attn = ~valid_mask
+        else:
+            pad_mask_for_attn = pad_mask
+            if max_n_cells is not None:
+                z_patch_batch = z_patch_flat.new_zeros(B, max_n_cells, z_patch_flat.shape[-1])
+                z_patch_batch[~pad_mask] = z_patch_flat
+                gene_context_batch = gene_context.new_zeros(B, max_n_cells, gene_context.shape[-1])
+                gene_context_batch[~pad_mask] = gene_context
             else:
-                pad_mask_for_attn = pad_mask
-                if max_n_cells is not None:
-                    z_patch_batch = z_patch_flat.new_zeros(B, max_n_cells, z_patch_flat.shape[-1])
-                    z_patch_batch[~pad_mask] = z_patch_flat
-                else:
-                    z_patch_batch = z_patch_flat.reshape(B, -1, z_patch_flat.shape[-1])
+                z_patch_batch = z_patch_flat.reshape(B, -1, z_patch_flat.shape[-1])
+                gene_context_batch = gene_context.reshape(B, -1, gene_context.shape[-1])
 
-            if direction in ("bottom_up", "bidirectional"):
-                z_region = self.patch_to_region(z_region, z_patch_batch, pad_mask=pad_mask_for_attn)
-                z_slide = self.region_to_slide(z_slide, z_region)
+        z_region, z_slide, region_assignment = self.dynamic_assignment(
+            z_patch_batch,
+            z_region,
+            z_slide,
+            gene_context_batch,
+            pad_mask=pad_mask_for_attn,
+        )
 
-            if direction in ("top_down", "bidirectional"):
-                z_region = self.slide_to_region(z_region, z_slide)
-                z_patch_batch = self.region_to_patch(z_patch_batch, z_region)
+        # ── DIAGNOSTIC CAPTURE (forward) ──
+        # Only stash during eval to avoid retaining graph / memory overhead during training.
+        if not self.training:
+            self._last_region_assignment = region_assignment.detach()
+            self._last_pad_mask = pad_mask_for_attn.detach() if pad_mask_for_attn is not None else None
+
+        # ── Cheap patch refinement from current region memory ──
+        if direction != "none":
+            patch_region = torch.einsum("bnk,bkd->bnd", region_assignment, z_region)
+            z_patch_batch = z_patch_batch + patch_region
 
             # Convert back to flat
             if pad_mask is not None:
                 z_patch_flat = z_patch_batch[~pad_mask]
             else:
                 z_patch_flat = z_patch_batch[valid_mask]
+
+        # Preserve the original patch semantics before the readout head.
+        z_patch_flat = z_patch_flat + torch.sigmoid(self.velocity_gate) * initial_patch
 
         # ── Velocity prediction from patch tokens ──
         velocity_flat = self.velocity_head(z_patch_flat)

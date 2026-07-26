@@ -1,0 +1,12 @@
+coding_exercise/
+dataset/
+results_dir/
+home/
+checkpoints/
+.vscode/
+.cache/
+
+wandb/
+
+/result.txt
+/coding_ex.py

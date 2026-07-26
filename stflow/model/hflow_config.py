@@ -36,7 +36,12 @@ class HFlowConfig:
     #   "learnable" — learnable region queries with cross-attention (default)
     #   "grid"      — hard spatial grid partitioning
     #   "kmeans"    — k-means soft assignment
+    #   "assignment" — dynamic patch-to-region soft assignment
     hflow_region_discovery: str = "learnable"
+
+    # Dynamic region-assignment controls
+    hflow_assignment_temperature: float = 1.0
+    hflow_assignment_entropy_weight: float = 0.0
 
     def __post_init__(self):
         valid_repr = {"flat", "slide_patch", "slide_region_patch"}
@@ -47,6 +52,6 @@ class HFlowConfig:
         assert self.hflow_cross_scale in valid_cs, \
             f"hflow_cross_scale must be one of {valid_cs}, got '{self.hflow_cross_scale}'"
 
-        valid_rd = {"learnable", "grid", "kmeans"}
+        valid_rd = {"learnable", "grid", "kmeans", "assignment"}
         assert self.hflow_region_discovery in valid_rd, \
             f"hflow_region_discovery must be one of {valid_rd}, got '{self.hflow_region_discovery}'"

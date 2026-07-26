@@ -22,6 +22,7 @@ class GeneUpdate(nn.Module):
             d_model, 
             n_genes,
             proj_drop=0.,
+            non_negative=True,
         ):
         super(GeneUpdate, self).__init__()    
 
