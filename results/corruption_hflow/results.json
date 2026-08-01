@@ -1,0 +1,127 @@
+{
+  "baseline": {
+    "MAE": 0.925717294216156,
+    "MSE": 1.5097910165786743,
+    "PCC": 0.5575045943260193
+  },
+  "zero/r=0/mr=0.1": {
+    "MAE": 1.0065550804138184,
+    "MSE": 1.8948338031768799,
+    "PCC": 0.34868037700653076,
+    "corruption_type": "zero",
+    "mask_ratio": 0.1,
+    "radius": 0
+  },
+  "zero/r=0/mr=0.25": {
+    "MAE": 1.1215523481369019,
+    "MSE": 2.4523816108703613,
+    "PCC": 0.23805148899555206,
+    "corruption_type": "zero",
+    "mask_ratio": 0.25,
+    "radius": 0
+  },
+  "zero/r=0/mr=0.5": {
+    "MAE": 1.3248319625854492,
+    "MSE": 3.428807497024536,
+    "PCC": 0.1409919559955597,
+    "corruption_type": "zero",
+    "mask_ratio": 0.5,
+    "radius": 0
+  },
+  "zero/r=128/mr=0.1": {
+    "MAE": 1.0068353414535522,
+    "MSE": 1.9012755155563354,
+    "PCC": 0.3439764678478241,
+    "corruption_type": "zero",
+    "mask_ratio": 0.1,
+    "radius": 128
+  },
+  "zero/r=128/mr=0.25": {
+    "MAE": 1.1178051233291626,
+    "MSE": 2.439368724822998,
+    "PCC": 0.24751240015029907,
+    "corruption_type": "zero",
+    "mask_ratio": 0.25,
+    "radius": 128
+  },
+  "zero/r=128/mr=0.5": {
+    "MAE": 1.3217964172363281,
+    "MSE": 3.4173848628997803,
+    "PCC": 0.15039411187171936,
+    "corruption_type": "zero",
+    "mask_ratio": 0.5,
+    "radius": 128
+  },
+  "zero/r=32/mr=0.1": {
+    "MAE": 1.0100914239883423,
+    "MSE": 1.9107937812805176,
+    "PCC": 0.34066808223724365,
+    "corruption_type": "zero",
+    "mask_ratio": 0.1,
+    "radius": 32
+  },
+  "zero/r=32/mr=0.25": {
+    "MAE": 1.126242756843567,
+    "MSE": 2.4695885181427,
+    "PCC": 0.2374579757452011,
+    "corruption_type": "zero",
+    "mask_ratio": 0.25,
+    "radius": 32
+  },
+  "zero/r=32/mr=0.5": {
+    "MAE": 1.3232141733169556,
+    "MSE": 3.419052839279175,
+    "PCC": 0.14471222460269928,
+    "corruption_type": "zero",
+    "mask_ratio": 0.5,
+    "radius": 32
+  },
+  "zero/r=64/mr=0.1": {
+    "MAE": 1.0085302591323853,
+    "MSE": 1.9066250324249268,
+    "PCC": 0.3392057716846466,
+    "corruption_type": "zero",
+    "mask_ratio": 0.1,
+    "radius": 64
+  },
+  "zero/r=64/mr=0.25": {
+    "MAE": 1.1194415092468262,
+    "MSE": 2.441699743270874,
+    "PCC": 0.24660369753837585,
+    "corruption_type": "zero",
+    "mask_ratio": 0.25,
+    "radius": 64
+  },
+  "zero/r=64/mr=0.5": {
+    "MAE": 1.3233635425567627,
+    "MSE": 3.425049304962158,
+    "PCC": 0.14741352200508118,
+    "corruption_type": "zero",
+    "mask_ratio": 0.5,
+    "radius": 64
+  },
+  "zero/r=96/mr=0.1": {
+    "MAE": 1.007672905921936,
+    "MSE": 1.8975768089294434,
+    "PCC": 0.3464491665363312,
+    "corruption_type": "zero",
+    "mask_ratio": 0.1,
+    "radius": 96
+  },
+  "zero/r=96/mr=0.25": {
+    "MAE": 1.1296155452728271,
+    "MSE": 2.48583722114563,
+    "PCC": 0.22705230116844177,
+    "corruption_type": "zero",
+    "mask_ratio": 0.25,
+    "radius": 96
+  },
+  "zero/r=96/mr=0.5": {
+    "MAE": 1.351697325706482,
+    "MSE": 3.514207601547241,
+    "PCC": 0.11141623556613922,
+    "corruption_type": "zero",
+    "mask_ratio": 0.5,
+    "radius": 96
+  }
+}

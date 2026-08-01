@@ -10,3 +10,6 @@ wandb/
 
 /result.txt
 /coding_ex.py
+/checkpoints/
+
+/__pychace__
