@@ -10,7 +10,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from stflow.model.fa import FrameAveraging
+from hmflow.model.fa import FrameAveraging
 
 
 def rearrange(x, pattern, **kwargs):

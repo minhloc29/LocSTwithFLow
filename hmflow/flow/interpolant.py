@@ -12,17 +12,17 @@ class Interpolant:
         self.prior_sampler = PriorSampler(prior_sample_type, device=self.device, **kwargs)
         self.normalize = normalize
     
-    def sample_from_prior(self, shape):
+    def sample_from_prior(self, shape): # just to get x0
         exp = self.prior_sampler.sample(shape).to(self.device)
         if self.normalize:
             exp = torch.log(exp + 1)
         return exp
 
-    def sample_t(self, shape):
+    def sample_t(self, shape): # random t [0, 1]
         return torch.rand(shape)
 
-    def corrupt_exp(self, exp):
-        # exp: [B, n_cells, n_genes]
+    def corrupt_exp(self, exp): # get x_t = (1-t)x0 + tx1
+        # exp: [B, n_cells, n_genes] -> normal ones
         t = self.sample_t((exp.shape[0],)).to(self.device)
         if exp.shape[0] > 1:
             t = t.squeeze(-1)

@@ -6,22 +6,16 @@ import pandas as pd
 from time import time
 from tqdm import tqdm
 from operator import itemgetter
-
 import torch
-
-try:
-    import wandb
-except ModuleNotFoundError:
-    wandb = None
-
-from stflow.utils import set_random_seed, get_current_time, merge_fold_results
-from stflow.data.dataset import HESTDatasetPath, MultiHESTDataset, padding_batcher, HESTDataset
-from stflow.data.normalize_utils import get_normalize_method
-from stflow.model.denoiser import HFlowDenoiser as Denoiser
-from stflow.model.hflow_config import HFlowConfig
-from stflow.flow.interpolant import Interpolant
-from stflow.app.flow.test import test
-from stflow.hest_utils.utils import save_pkl
+import wandb
+from hmflow.utils import set_random_seed, get_current_time, merge_fold_results
+from hmflow.data.dataset import HESTDatasetPath, MultiHESTDataset, padding_batcher, HESTDataset
+from hmflow.data.normalize_utils import get_normalize_method
+from hmflow.model.denoiser import HFlowDenoiser as Denoiser
+from hmflow.model.hflow_config import HFlowConfig
+from hmflow.flow.interpolant import Interpolant
+from hmflow.app.flow.test import test
+from hmflow.hest_utils.utils import save_pkl
 
 
 def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkpoint_save_dir):
@@ -101,6 +95,10 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
             img_features, coords, gene_exp = batch
 
             noisy_exp, t_steps = diffusier.corrupt_exp(gene_exp)
+            # noisy_exp: xt = (1-t)x0 + x1
+            # t_steps: t
+            
+            
             pred_exp, loss = model(
                 exp=noisy_exp, 
                 img_features=img_features, 
@@ -196,8 +194,8 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--datasets', nargs='+', default=["all"], help="LUNG, READ, HCC, COAD")
     parser.add_argument('--use_wandb', default=True)
-    parser.add_argument('--source_dataroot', default="/home/username/Anonymous_STFlow/dataset/")
-    parser.add_argument('--embed_dataroot', type=str, default="/home/username/Anonymous_STFlow/dataset/embed_dataroot")
+    parser.add_argument('--source_dataroot', default="/home/username/Anonymous_hmflow/dataset/")
+    parser.add_argument('--embed_dataroot', type=str, default="/home/username/Anonymous_hmflow/dataset/embed_dataroot")
     parser.add_argument('--gene_list', type=str, default='var_50genes.json')
     parser.add_argument('--save_dir', type=str, default="results_dir/")
     parser.add_argument('--feature_encoder', type=str, default='uni_v1_official', help="uni_v1_official | resnet50_trunc | ciga | gigapath")
@@ -208,8 +206,8 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--sample_times', type=int, default=10, help='Number of times to sample patches from each image')
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size')
-    parser.add_argument('--lr', type=float, default=5e-4)
-    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--clip_norm', type=float, default=1.)
     parser.add_argument('--save_step', type=int, default=-1)
     parser.add_argument('--eval_step', type=int, default=1)
@@ -219,7 +217,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_genes', type=int, default=50)
 
     # flow matching hyperparameters
-    parser.add_argument('--n_sample_steps', type=int, default=5)
+    parser.add_argument('--n_sample_steps', type=int, default=3)
     parser.add_argument('--prior_sampler', type=str, default="zinb", help="gaussian | uniform | zero | zinb")
     parser.add_argument('--zinb_logits', type=float, default=0.1)
     parser.add_argument('--zinb_total_count', type=float, default=1)

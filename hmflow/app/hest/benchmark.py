@@ -12,12 +12,12 @@ from sklearn.discriminant_analysis import StandardScaler
 from huggingface_hub import snapshot_download, hf_hub_download
 
 from trainer import train_test_reg
-from stflow.utils import set_random_seed
-from stflow.hest_utils.encoder import load_encoder
-from stflow.hest_utils.st_dataset import H5TileDataset, load_adata
-from stflow.hest_utils.utils import get_current_time, save_pkl, merge_dict, get_path
-from stflow.hest_utils.file_utils import save_hdf5, read_assets_from_h5
-from stflow.data.normalize_utils import get_normalize_method
+from hmflow.utils import set_random_seed
+from hmflow.hest_utils.encoder import load_encoder
+from hmflow.hest_utils.st_dataset import H5TileDataset, load_adata
+from hmflow.hest_utils.utils import get_current_time, save_pkl, merge_dict, get_path
+from hmflow.hest_utils.file_utils import save_hdf5, read_assets_from_h5
+from hmflow.data.normalize_utils import get_normalize_method
 
 
 class LazyEncoder:

@@ -8,8 +8,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from stflow.hest_utils.st_dataset import load_adata
-from stflow.hest_utils.file_utils import read_assets_from_h5
+from hmflow.hest_utils.st_dataset import load_adata
+from hmflow.hest_utils.file_utils import read_assets_from_h5
 from .sampling_utils import PatchSampler
 
 

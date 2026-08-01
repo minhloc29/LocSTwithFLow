@@ -55,10 +55,7 @@ class RegionCrossAttention(nn.Module):
 
 
 class GridRegionDiscovery(nn.Module):
-    """
-    Hard spatial grid partitioning.
-    Divides the slide into K grid cells and pools patch features within each cell.
-    """
+  
 
     def __init__(self, d_model, n_grid_cols=4, n_grid_rows=4):
         super().__init__()

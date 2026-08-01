@@ -15,13 +15,14 @@ import math
 import torch
 import torch.nn as nn
 
-from stflow.model.hflow_config import HFlowConfig
-from stflow.model.hierarchy import HierarchyEncoder
-from stflow.model.hflow_block import HFlowBlock
+from hmflow.model.hflow_config import HFlowConfig
+from hmflow.model.hierarchy import HierarchyEncoder
+from hmflow.model.hflow_block import HFlowBlock
 
 
 class TimestepEmbedder(nn.Module):
-
+    # We want the neural network to know "what time it is" in the diffusion process.
+    # Time = 73 not informative -> [0.1, 0.15,...] better
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -37,6 +38,8 @@ class TimestepEmbedder(nn.Module):
         freqs = torch.exp(
             -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
         ).to(device=t.device)
+        
+        # freqs[none] create new dims at dim = 0
         args = t[..., None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
@@ -50,6 +53,8 @@ class TimestepEmbedder(nn.Module):
 
 
 class HFlowDenoiser(nn.Module):
+    # my work: input: image features, noisy exp x_t, coord (x, y), timestep t -> output: enpoint x1
+    # how to predict genes: output is patch updated -> input to predict genes
     """
     Hierarchical Flow Denoiser.
 
@@ -78,19 +83,15 @@ class HFlowDenoiser(nn.Module):
         self.representation = hflow_config.hflow_representation
         self.dynamic_update = hflow_config.hflow_dynamic_update
 
-        # ── Time embedding ──
         self.fourier_proj = TimestepEmbedder(self.d_model)
 
-        # ── Patch image feature projector ──
         self.image_transform = nn.Linear(model_config.feature_dim, self.d_model)
 
-        # ── Hierarchy encoder (initializes z_patch, z_region, z_slide) ──
         if self.representation in ("slide_patch", "slide_region_patch"):
             self.hierarchy_encoder = HierarchyEncoder(self.d_model, hflow_config)
 
-        # ── HFlowBlock layers ──
         if self.representation == "flat":
-            from stflow.model.transformer import SpatialTransformer
+            from hmflow.model.transformer import SpatialTransformer
             self.backbone = SpatialTransformer(model_config)
         else:
             self.blocks = nn.ModuleList([
@@ -109,11 +110,9 @@ class HFlowDenoiser(nn.Module):
 
         self.loss_func = nn.MSELoss()
 
-        # ── DIAGNOSTIC CAPTURE (init) ──
         self._last_region_assignment = None
         self._all_block_region_assignments = None
 
-    # ── helpers ────────────────────────────────────────────────────────
 
     def _build_graph(self, coords_flat, batch_idx, n_neighbors, exclude_self=True):
         N = coords_flat.shape[0]
@@ -131,10 +130,7 @@ class HFlowDenoiser(nn.Module):
         return nearest_indices
 
     def _build_hierarchy(self, img_features, coords, pad_mask):
-        """
-        Encode the initial three-level hierarchy from image features.
-        Called exactly once per slide — on the first Euler step.
-        """
+        # output [patch, region, slide] cung luc
         if self.representation in ("slide_patch", "slide_region_patch"):
             patch_embs = self.image_transform(img_features)          # [B, N, d_model]
             z_patch, z_region, z_slide = self.hierarchy_encoder(
@@ -214,14 +210,12 @@ class HFlowDenoiser(nn.Module):
 
         z_patch_flat = self._flatten_patches(z_patch, pad_mask)
 
-        # ── Step B: k-NN graph (fixed per slide) ──────────────────────
         nearest_indices = self._build_graph(
             coords_flat, batch_idx,
             min(self.mcfg.n_neighbors, N_cells),
             exclude_self=True,
         )
 
-        # ── Step C: Run HFlowBlocks ───────────────────────────────────
         curr_z_patch = z_patch_flat
         curr_z_region = z_region
         curr_z_slide = z_slide
@@ -229,7 +223,6 @@ class HFlowDenoiser(nn.Module):
 
         for block in self.blocks:
             if self.dynamic_update:
-                # Dynamic: hierarchy state is *carried forward*, not reset
                 pass
             else:
                 # Static: reset to the initial hierarchy before each block
@@ -250,23 +243,16 @@ class HFlowDenoiser(nn.Module):
             )
             block_velocities.append(velocity_flat)
 
-        # Average every block's prediction so each block receives direct supervision.
         prediction_flat = torch.stack(block_velocities).mean(0)
-        # prediction_flat = block_velocities[0]
-        # Convert back to batched form
+      
         prediction = prediction_flat.new_zeros(B, N_cells, prediction_flat.shape[-1])
         prediction[~pad_mask] = prediction_flat
 
-        # Build new hierarchy state for next Euler step
-        # Convert updated flat patches back to batched form
+    
         z_patch_updated = z_patch.new_zeros(B, N_cells, self.d_model)
         z_patch_updated[~pad_mask] = curr_z_patch
         new_hierarchy_state = (z_patch_updated, curr_z_region, curr_z_slide)
 
-        # ── DIAGNOSTIC CAPTURE (after block loop) ──
-        # Uses the LAST block's region assignment as the "final" regional read-out
-        # for this Euler step. Also keeps all 4 blocks' assignments for optional
-        # per-block consistency analysis (Tier-2 metric).
         if not self.training:
             self._last_region_assignment = self.blocks[-1]._last_region_assignment
             self._all_block_region_assignments = [
@@ -275,7 +261,6 @@ class HFlowDenoiser(nn.Module):
 
         return prediction, new_hierarchy_state
 
-    # ── public API ────────────────────────────────────────────────────
 
     def inference(self, noisy_exp, img_features, coords, t_steps,
                   hierarchy_state=None):
@@ -302,11 +287,7 @@ class HFlowDenoiser(nn.Module):
         )
 
     def forward(self, exp, img_features, coords, labels, t_steps):
-        """
-        Training forward pass — single step, always encodes hierarchy fresh.
-
-        Returns (prediction, loss).
-        """
+      
         prediction, _ = self.inference(exp, img_features, coords, t_steps,
                                        hierarchy_state=None)
         pad_mask = img_features.sum(-1) == 0
