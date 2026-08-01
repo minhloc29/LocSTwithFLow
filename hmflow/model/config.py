@@ -39,13 +39,7 @@ class ModelConfig():
         for key, value in kwargs.items():
             setattr(self, key, value)
         
-        if hasattr(self, "pairwise_hidden_dim") and not hasattr(self, "d_edge_model"):
-            self.d_edge_model = self.pairwise_hidden_dim
-        elif hasattr(self, "d_edge_model") and not hasattr(self, "pairwise_hidden_dim"):
-            self.pairwise_hidden_dim = self.d_edge_model
-        elif not hasattr(self, "d_edge_model"):
-            self.d_edge_model = self.d_model  # fallback: match d_model
-            self.pairwise_hidden_dim = self.d_edge_model
+      
             
         self._hidden_dim_check()
 
@@ -53,10 +47,4 @@ class ModelConfig():
         # check if d_model/d_edge_model can be divided by n_heads
         assert self.d_model % self.n_heads == 0, f"d_model should be divisible by n_heads"
 
-    def _hidden_dim_check(self):
-        # check if d_model/d_edge_model can be divided by n_heads
-        assert self.d_model % self.n_heads == 0, f"d_model should be divisible by n_heads"
-        if self.d_edge_model % self.n_heads != 0:
-            import warnings
-            warnings.warn(f"d_edge_model ({self.d_edge_model}) not divisible by n_heads ({self.n_heads}); rounding down")
-            self.d_edge_model = (self.d_edge_model // self.n_heads) * self.n_heads
+    

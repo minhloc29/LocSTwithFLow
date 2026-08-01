@@ -197,7 +197,12 @@ def run_corruption_evaluation(args: argparse.Namespace) -> dict:
         feature_dim=args.feature_dim,
         pairwise_hidden_dim=args.pairwise_hidden_dim,
         activation=args.activation,
+        mlp_ratio=args.mlp_ratio,
     )
+    # Map aliases — mirrors train.py lines 258-261
+    model_config.d_edge_model = args.pairwise_hidden_dim
+    model_config.act = args.activation
+
     hflow_config = HFlowConfig(
         n_region_queries=args.n_region_queries,
         region_hidden_dim=args.hidden_dim,
@@ -363,6 +368,7 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("Architecture")
     g.add_argument("--hidden_dim", type=int, default=128)
     g.add_argument("--pairwise_hidden_dim", type=int, default=128)
+    g.add_argument("--mlp_ratio", type=float, default=4.0)
     g.add_argument("--n_layers", type=int, default=4)
     g.add_argument("--dropout", type=float, default=0.2)
     g.add_argument("--attn_dropout", type=float, default=0.2)
@@ -402,7 +408,7 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("Misc")
     g.add_argument("--save_dir", type=str, default="results/corruption_eval",
                    help="Output directory for results")
-    g.add_argument("--seed", type=int, default=42)
+    g.add_argument("--seed", type=int, default=1)
     g.add_argument("--device", type=str, default="cuda:0")
 
     return p
