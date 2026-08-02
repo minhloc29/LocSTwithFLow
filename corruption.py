@@ -1,11 +1,3 @@
-"""
-Corruption helpers for local-morphology robustness experiments.
-
-Provides `apply_local_artifact()` and multiple corruption types that
-simulate real histopathology artifacts (tissue folds, staining noise,
-missing tissue, blur).  All operations are deterministic given a seed.
-"""
-
 import torch
 import numpy as np
 from typing import Optional, Literal, Tuple
@@ -25,43 +17,7 @@ def apply_local_artifact(
     dropout_p: float = 0.5,
     seed: Optional[int] = None,
 ) -> torch.Tensor:
-    """
-    Corrupt image features locally by simulating pathology artifacts.
-
-    For each item in the batch:
-      1. Sample K = ceil(mask_ratio * N) target spots uniformly at random.
-      2. For each target spot, find all neighbours within Euclidean distance
-         *radius* (using *coords*).
-      3. Corrupt the image features of those neighbours according to
-         *corruption_type*.
-
-    Parameters
-    ----------
-    img_features :  torch.Tensor  [B, N, feature_dim]
-        Original image features (e.g. from a foundation model).
-    coords :        torch.Tensor  [B, N, 2]
-        Spatial coordinates (decentred or raw).
-    radius :        float
-        Neighbourhood radius in coordinate units.  0 = single-spot masking.
-    mask_ratio :    float
-        Fraction of spots to use as artifact centres (0 < mask_ratio ≤ 1).
-    corruption_type : str
-        ``"zero"``     — set features to 0            (tissue fold / tear)
-        ``"gaussian"`` — add Gaussian noise           (staining failure)
-        ``"dropout"``  — random feature dropout        (missing tissue)
-        ``"blur"``     — neighbour-feature averaging   (scanner blur)
-    sigma :         float
-        Standard deviation of Gaussian noise (only for ``"gaussian"``).
-    dropout_p :     float
-        Per-feature dropout probability (only for ``"dropout"``).
-    seed :          int, optional
-        Random seed for reproducibility.
-
-    Returns
-    -------
-    torch.Tensor  [B, N, feature_dim]
-        Corrupted image features (modification in-place on a copy).
-    """
+    
     if seed is not None:
         torch.manual_seed(seed)
         np.random.seed(seed)

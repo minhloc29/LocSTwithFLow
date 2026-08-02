@@ -1,11 +1,3 @@
-"""
-HFlowBlock — The core building block of the Hierarchical Biological Flow Transformer.
-
-[PATCHED] Adds capture of region_assignment / pad_mask for offline diagnostics
-(Moran's I subset analysis, region-tissue correspondence ARI/NMI). See the two
-blocks marked "# ── DIAGNOSTIC CAPTURE ──" below.
-"""
-
 import math
 import torch
 import torch.nn as nn
@@ -305,8 +297,6 @@ class HFlowBlock(nn.Module):
         self.velocity_gate = nn.Parameter(torch.tensor(-2.1972246))
         self.slide_proj = nn.Linear(d_model, d_model)              # ← add this
         self.slide_gate_inject = nn.Parameter(torch.tensor(-2.1972246))
-        self.region_norm = nn.LayerNorm(d_model)
-        self.slide_norm = nn.LayerNorm(d_model)
         self.dynamic_assignment = DynamicRegionAssignment(d_model, d_model, drop=proj_drop)
 
         self.velocity_head = nn.Sequential(
@@ -405,28 +395,23 @@ class HFlowBlock(nn.Module):
             pad_mask=pad_mask_for_attn,
         )
 
-        # ── DIAGNOSTIC CAPTURE (forward) ──
-        # Only stash during eval to avoid retaining graph / memory overhead during training.
         if not self.training:
             self._last_region_assignment = region_assignment.detach()
             self._last_pad_mask = pad_mask_for_attn.detach() if pad_mask_for_attn is not None else None
         slide_signal = self.slide_proj(z_slide)                     # [B, 1, d_model]
         z_patch_batch = z_patch_batch + torch.sigmoid(self.slide_gate_inject) * slide_signal  # br
-        # ── Cheap patch refinement from current region memory ──
+
         if direction != "none":
             patch_region = torch.einsum("bnk,bkd->bnd", region_assignment, z_region)
             z_patch_batch = z_patch_batch + patch_region
 
-            # Convert back to flat
             if pad_mask is not None:
                 z_patch_flat = z_patch_batch[~pad_mask]
             else:
                 z_patch_flat = z_patch_batch[valid_mask]
 
-        # Preserve the original patch semantics before the readout head.
         z_patch_flat = z_patch_flat + torch.sigmoid(self.velocity_gate) * initial_patch
 
-        # ── Velocity prediction from patch tokens ──
         velocity_flat = self.velocity_head(z_patch_flat)
 
         return velocity_flat, z_patch_flat, z_region, z_slide

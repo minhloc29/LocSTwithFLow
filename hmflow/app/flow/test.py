@@ -1,25 +1,3 @@
-"""
-Drop-in replacement for stflow/app/flow/test.py's `test()` function.
-
-Adds, on top of the original PCC/R2/L2 metrics:
-  - per-slide coordinates (needed for Moran's I — spatial autocorrelation
-    is only meaningful within a slide, not pooled across slides)
-  - slide_id per spot (so downstream analysis can group correctly)
-  - region assignment matrices per spot (needed for region-tissue
-    correspondence / ARI-NMI). Requires the small patch in
-    patch_capture_diagnostics.py to be applied first, so the model
-    exposes `_last_region_assignment` after each inference() call.
-    If you haven't applied that patch yet, this still works — region
-    fields will just be None / skipped.
-
-Usage is identical to before:
-    res_dict, dump = test(args, diffusier, model, val_loaders, return_all=True)
-    # dump now also has 'coords_all', 'slide_id_all', 'region_assignments_all'
-
-Save the dump with save_pkl(...) once per trained checkpoint (flat, static,
-dynamic) so the analysis script can load and compare them offline.
-"""
-
 import torch
 import numpy as np
 from scipy.stats import pearsonr

@@ -1,16 +1,3 @@
-"""
-HFlowDenoiser — Hierarchical Biological Flow Denoiser for STFlow.
-
-Central novelty: hierarchy state (z_slide, z_region, z_patch) persists across
-flow timesteps, not just across internal transformer layers.  This means the
-biological representation of the slide evolves jointly with the generative
-process, exactly as described in the HFlow-ST proposal.
-
-[PATCHED] After the HFlowBlock loop, exposes `_last_region_assignment` and
-`_all_block_region_assignments` on the denoiser (only during eval), read
-externally by test_with_diagnostics.py.
-"""
-
 import math
 import torch
 import torch.nn as nn
@@ -55,21 +42,6 @@ class TimestepEmbedder(nn.Module):
 class HFlowDenoiser(nn.Module):
     # my work: input: image features, noisy exp x_t, coord (x, y), timestep t -> output: enpoint x1
     # how to predict genes: output is patch updated -> input to predict genes
-    """
-    Hierarchical Flow Denoiser.
-
-    The conditioning hierarchy (slide, region, patch tokens) is computed
-    once from the image features and then evolved through the flow trajectory
-    by the HFlowBlocks.  Each call to inference() both accepts and returns
-    the current hierarchy state, allowing the sampling loop to thread it
-    across Euler steps.
-
-    Ablation modes:
-        flat                — original STFlow (no hierarchy)
-        slide_patch         — slide + patch tokens, no region level
-        slide_region_patch  — full hierarchy (default)
-        dynamic_update      — hierarchy resets between layers vs. persists
-    """
 
     def __init__(self, model_config, hflow_config=None):
         super().__init__()
@@ -81,7 +53,6 @@ class HFlowDenoiser(nn.Module):
         self.hcfg = hflow_config
         self.d_model = model_config.d_model
         self.representation = hflow_config.hflow_representation
-        self.dynamic_update = hflow_config.hflow_dynamic_update
 
         self.fourier_proj = TimestepEmbedder(self.d_model)
 
@@ -158,8 +129,6 @@ class HFlowDenoiser(nn.Module):
         coords_flat = coords[~pad_mask]
         return pad_mask, batch_idx, noisy_exp_flat, coords_flat
 
-    # ── flat mode (original STFlow) ────────────────────────────────────
-
     def _inference_flat(self, noisy_exp, img_features, coords, t_steps):
         B, N_cells, _ = noisy_exp.shape
         t_emb = self.fourier_proj(t_steps)
@@ -168,24 +137,16 @@ class HFlowDenoiser(nn.Module):
         features = img_proj + t_emb_expanded
         return self.backbone(gene_exp=noisy_exp, features=features, coords=coords)
 
-    # ── hierarchical mode ─────────────────────────────────────────────
 
     def _inference_hierarchical(
         self,
         noisy_exp,
         img_features,
         coords,
-        t_steps,
-        hierarchy_state=None,
+        t_steps
     ):
-        """
-        Returns (prediction, new_hierarchy_state).
-
-        hierarchy_state = (z_patch_flat, z_region, z_slide) to resume,
-        or None to encode from scratch.
-        """
+       
         B, N_cells, _ = noisy_exp.shape
-        device = noisy_exp.device
         self._last_assignment_entropy = None
 
         pad_mask, batch_idx, noisy_exp_flat, coords_flat = self._prepare_flat_inputs(
@@ -193,20 +154,14 @@ class HFlowDenoiser(nn.Module):
         )
         t_emb = self.fourier_proj(t_steps)  # [B, d_model]
 
-        # ── Step A: Build or resume hierarchy ──────────────────────────
-        if hierarchy_state is None:
-            # First call at this flow step: encode from image
-            z_patch, z_region, z_slide = self._build_hierarchy(
-                img_features,
-                coords,
-                pad_mask,
-            )
-            # Add time embedding — only once (it becomes part of the state)
-            t_emb_batch = t_emb[:, None, :].expand(B, N_cells, -1)
-            z_patch = z_patch + t_emb_batch
-        else:
-            z_patch, z_region, z_slide = hierarchy_state
-            # The hierarchy carries its own time context from previous steps
+        z_patch, z_region, z_slide = self._build_hierarchy(
+            img_features,
+            coords,
+            pad_mask,
+        )
+
+        t_emb_batch = t_emb[:, None, :].expand(B, N_cells, -1)
+        z_patch = z_patch + t_emb_batch
 
         z_patch_flat = self._flatten_patches(z_patch, pad_mask)
 
@@ -222,13 +177,10 @@ class HFlowDenoiser(nn.Module):
         block_velocities = []
 
         for block in self.blocks:
-            if self.dynamic_update:
-                pass
-            else:
-                # Static: reset to the initial hierarchy before each block
-                curr_z_patch = z_patch_flat
-                curr_z_region = z_region
-                curr_z_slide = z_slide
+        
+            curr_z_patch = z_patch_flat
+            curr_z_region = z_region
+            curr_z_slide = z_slide
 
             velocity_flat, curr_z_patch, curr_z_region, curr_z_slide = block(
                 noisy_exp_flat=noisy_exp_flat,
@@ -262,8 +214,7 @@ class HFlowDenoiser(nn.Module):
         return prediction, new_hierarchy_state
 
 
-    def inference(self, noisy_exp, img_features, coords, t_steps,
-                  hierarchy_state=None):
+    def inference(self, noisy_exp, img_features, coords, t_steps):
         """
         Single-step flow inference.
 
@@ -281,15 +232,11 @@ class HFlowDenoiser(nn.Module):
         if self.representation == "flat":
             return self._inference_flat(noisy_exp, img_features, coords, t_steps), None
 
-        return self._inference_hierarchical(
-            noisy_exp, img_features, coords, t_steps,
-            hierarchy_state=hierarchy_state,
-        )
+        return self._inference_hierarchical(noisy_exp, img_features, coords, t_steps)
 
     def forward(self, exp, img_features, coords, labels, t_steps):
       
-        prediction, _ = self.inference(exp, img_features, coords, t_steps,
-                                       hierarchy_state=None)
+        prediction, _ = self.inference(exp, img_features, coords, t_steps)
         pad_mask = img_features.sum(-1) == 0
         loss = self.loss_func(prediction[~pad_mask], labels[~pad_mask])
         return prediction, loss

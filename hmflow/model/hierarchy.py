@@ -1,44 +1,11 @@
-"""
-Hierarchical Encoder for HFlow-ST.
-
-Produces the initial three-level biological representation:
-    Patch tokens  →  Region tokens  →  Slide token
-
-Supports three region-discovery methods:
-    learnable  — K learnable queries with cross-attention (default)
-    grid       — hard spatial grid partitioning
-    kmeans     — k-means soft assignment on coordinates
-"""
-
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _get_sincos_pos_embed(embed_dim, coords):
-    """Sinusoidal positional encoding for 2D coordinates."""
-    # coords: [N, 2] normalized to ~[-1, 1]
-    half = embed_dim // 2
-    freqs = torch.exp(
-        -math.log(10000) * torch.arange(0, half, dtype=torch.float32, device=coords.device) / half
-    )  # [half]
-    angles = coords[..., :2].unsqueeze(-1) * freqs[None, None, :]  # [N, 2, half]
-    pos = torch.cat([angles.sin(), angles.cos()], dim=-1)  # [N, 2, 2*half]
-    pos = pos.view(coords.shape[0], -1)  # [N, 2*embed_dim], trimmed to embed_dim below
-    if pos.shape[-1] < embed_dim:
-        pos = F.pad(pos, (0, embed_dim - pos.shape[-1]))
-    return pos[..., :embed_dim]
-
-
 class RegionCrossAttention(nn.Module):
-    """
-    Lightweight learnable region prototype initializer.
-
-    This keeps the initial hierarchy cheap: regions start as learnable
-    prototypes and are then refined by the dynamic assignment mechanism in
-    HFlowBlock.
-    """
+   
 
     def __init__(self, d_model, n_queries, **kwargs):
         super().__init__()
@@ -68,21 +35,17 @@ class GridRegionDiscovery(nn.Module):
         B, N, D = patch_embs.shape
         device = patch_embs.device
 
-        # Normalize coordinates to [0, 1]
         coord_min = coords.min(dim=1, keepdim=True)[0]
         coord_max = coords.max(dim=1, keepdim=True)[0]
         norm_coords = (coords - coord_min) / (coord_max - coord_min + 1e-8)  # [B, N, 2]
 
-        # Assign each point to a grid cell
         col_idx = (norm_coords[..., 0] * self.n_grid_cols).long().clamp(0, self.n_grid_cols - 1)
         row_idx = (norm_coords[..., 1] * self.n_grid_rows).long().clamp(0, self.n_grid_rows - 1)
         cell_idx = row_idx * self.n_grid_cols + col_idx  # [B, N]
 
-        # Zero out padding positions
         if pad_mask is not None:
             cell_idx = cell_idx.masked_fill(pad_mask, -1)  # -1 = ignore
 
-        # Vectorized scatter_add_ for pooling
         flat_region_embs = torch.zeros(B * self.n_queries, D, device=device)
         flat_counts = torch.zeros(B * self.n_queries, device=device)
 
@@ -106,11 +69,7 @@ class GridRegionDiscovery(nn.Module):
         return region_embs
 
 class KMeansRegionDiscovery(nn.Module):
-    """
-    Learns K centroid embeddings; patches are softly assigned via attention
-    to centroids based on spatial proximity + feature similarity.
-    """
-
+   
     def __init__(self, d_model, n_queries):
         super().__init__()
         self.n_queries = n_queries
@@ -129,12 +88,9 @@ class KMeansRegionDiscovery(nn.Module):
 
         centroids = self.centroids.expand(B, -1, -1)  # [B, K, D]
 
-        # Compute assignment weights: softmax over centroid similarity
-        # similarity = cosine similarity between patch and centroid
         patch_norm = F.normalize(patch_embs, dim=-1)
         centroid_norm = F.normalize(centroids, dim=-1)
 
-        # [B, N, K] similarity matrix
         sim = torch.bmm(patch_norm, centroid_norm.transpose(1, 2))
         sim = sim * self.temperature.clamp(min=0.5, max=10.0)
 
@@ -143,7 +99,6 @@ class KMeansRegionDiscovery(nn.Module):
 
         assign_weights = F.softmax(sim, dim=-1)  # [B, N, K]
 
-        # Weighted sum: patches → regions
         region_embs = torch.bmm(assign_weights.transpose(1, 2), patch_embs)  # [B, K, D]
         region_counts = assign_weights.sum(dim=1).clamp(min=1)  # [B, K]
         region_embs = region_embs / region_counts.unsqueeze(-1)
@@ -153,12 +108,7 @@ class KMeansRegionDiscovery(nn.Module):
 
 
 class SlidePooling(nn.Module):
-    """
-    Aggregates region tokens into a single slide-level token.
-
-    Uses attention pooling: 1 learnable CLS query attends to all region tokens.
-    """
-
+   
     def __init__(self, d_model, n_heads=4, dropout=0.1):
         super().__init__()
         self.slide_query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
@@ -176,12 +126,7 @@ class SlidePooling(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, region_embs):
-        """
-        Args:
-            region_embs: [B, K, d_model]
-        Returns:
-            slide_emb: [B, 1, d_model]
-        """
+        
         B = region_embs.shape[0]
         slide_query = self.slide_query.expand(B, -1, -1)
 
@@ -250,13 +195,9 @@ class HierarchyEncoder(nn.Module):
             z_region: [B, K, d_model]
             z_slide:  [B, 1, d_model]
         """
-        # Normalize patch embs
         z_patch = self.patch_proj(patch_embs)
 
-        # Discover regions
         z_region = self.region_discovery(z_patch, coords, pad_mask=pad_mask)
-
-        # Pool regions → slide
         z_slide = self.slide_pool(z_region)
 
         return z_patch, z_region, z_slide

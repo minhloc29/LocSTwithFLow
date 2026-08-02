@@ -65,7 +65,6 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
         region_hidden_dim=args.hidden_dim,
         slide_hidden_dim=args.hidden_dim,
         hflow_representation=args.hflow_representation,
-        hflow_dynamic_update=args.hflow_dynamic_update,
         hflow_cross_scale=args.hflow_cross_scale,
         hflow_region_discovery=args.hflow_region_discovery,
         hflow_assignment_temperature=args.hflow_assignment_temperature,
@@ -94,11 +93,12 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
             batch = [x.to(device) for x in batch]
             img_features, coords, gene_exp = batch
 
+            #STEP 1:
             noisy_exp, t_steps = diffusier.corrupt_exp(gene_exp)
             # noisy_exp: xt = (1-t)x0 + x1
             # t_steps: t
             
-            
+            # STEP 2:
             pred_exp, loss = model(
                 exp=noisy_exp, 
                 img_features=img_features, 
@@ -209,7 +209,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--clip_norm', type=float, default=1.)
-    parser.add_argument('--save_step', type=int, default=-1)
+    parser.add_argument('--save_step', type=int, default=100)
     parser.add_argument('--eval_step', type=int, default=1)
     parser.add_argument('--num_workers', type=int, default=1, help='Number of workers for dataloader')
     parser.add_argument('--loss_func', type=str, default='mse', help="mse | mae | pearson")
@@ -239,10 +239,6 @@ if __name__ == '__main__':
     # hierarchical flow matching hyperparameters (HFlow-ST)
     parser.add_argument('--hflow_representation', type=str, default='slide_region_patch',
                         help="flat | slide_patch | slide_region_patch")
-    parser.add_argument('--hflow_dynamic_update', action='store_true', default=True,
-                        help="Update hierarchy at every flow step")
-    parser.add_argument('--hflow_no_dynamic_update', dest='hflow_dynamic_update', action='store_false',
-                        help="Keep hierarchy fixed during flow")
     parser.add_argument('--hflow_cross_scale', type=str, default='bidirectional',
                         help="none | top_down | bottom_up | bidirectional")
     parser.add_argument('--hflow_region_discovery', type=str, default='learnable',
@@ -255,8 +251,6 @@ if __name__ == '__main__':
                         help="Entropy regularization weight for dynamic assignments")
     args = parser.parse_args()
 
-    # HFlowDenoiser expects the model width under d_model; keep the CLI's
-    # hidden_dim as the single source of truth and expose it under both names.
     args.d_model = args.hidden_dim
     args.d_edge_model = args.pairwise_hidden_dim
     args.act = args.activation

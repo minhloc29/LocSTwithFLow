@@ -30,9 +30,6 @@ class Interpolant:
         return exp_0 * (1 - t[:, None, None]) + exp * t[:, None, None], t
 
     def denoise(self, exp_1, exp_t, t, d_t):
-        # exp_1: [B, n_cells, n_genes]
-        # exp_t: [B, n_cells, n_genes]
-        # t: [B]
-        # d_t: [B]
+       
         exp_vf = (exp_1 - exp_t) / (1 - t[:, None, None])
         return exp_t + d_t[:, None, None] * exp_vf
