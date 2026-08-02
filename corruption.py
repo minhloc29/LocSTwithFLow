@@ -85,11 +85,25 @@ def apply_local_artifact(
         dist = diff.norm(dim=-1)                                      # [N, N]
 
         # 3. For every target, find neighbours within radius
-        within_radius = dist[target_idx] <= radius                    # [K, N]
-        mask = within_radius.any(dim=0)                               # [N]
+        k = min(int(radius), N - 1)
 
-        # At minimum mask the target spots themselves
-        mask[target_idx] = True
+        nearest_idx = dist.topk(k + 1, largest=False).indices
+
+        mask = torch.zeros(N, dtype=torch.bool, device=device)
+
+        perm = torch.randperm(N, device=device)
+
+        target_corrupted = int(mask_ratio * N)
+
+        for center in perm:
+
+            if radius == 0:
+                mask[center] = True
+            else:
+                mask[nearest_idx[center]] = True
+
+            if mask.sum() >= target_corrupted:
+                break
 
         idx = mask  # boolean index of spots to corrupt
 
@@ -120,7 +134,25 @@ def apply_local_artifact(
 
         else:
             raise ValueError(f"Unknown corruption_type: {corruption_type}")
+        # 1. Coordinate scale
+        print(
+            "Distance stats:",
+            dist.min().item(),
+            dist.mean().item(),
+            dist.max().item(),
+        )
 
+        # 2. Average neighbors within each radius
+        for r in [0, 32, 64, 96, 128]:
+            avg_neighbors = (dist <= r).float().sum(-1).mean().item()
+            print(f"Radius {r}: {avg_neighbors:.1f} neighbors")
+
+        # 3. Feature statistics
+        print(
+            "Feature mean/std:",
+            img_features.mean().item(),
+            img_features.std().item(),
+        )
     return out
 
 

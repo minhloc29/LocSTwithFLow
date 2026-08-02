@@ -4,9 +4,6 @@ HFlowBlock — The core building block of the Hierarchical Biological Flow Trans
 [PATCHED] Adds capture of region_assignment / pad_mask for offline diagnostics
 (Moran's I subset analysis, region-tissue correspondence ARI/NMI). See the two
 blocks marked "# ── DIAGNOSTIC CAPTURE ──" below.
-
-[SLOT ATTENTION] Replaced one-shot DynamicRegionAssignment with iterative
-Gene-Conditioned Slot Attention for richer region discovery.
 """
 
 import math
@@ -35,106 +32,78 @@ def einsum(*operands_and_equation):
     return torch.einsum(equation, operands)
 
 
-class IterativeRegionDiscovery(nn.Module):
-    """
-    Gene-conditioned iterative Slot Attention for region discovery.
+def gru_update(cell, hidden, candidate):
+    """Apply a GRUCell over batched sequence/state tensors."""
+    hidden_shape = hidden.shape
+    updated = cell(candidate.reshape(-1, candidate.shape[-1]), hidden.reshape(-1, hidden.shape[-1]))
+    return updated.reshape(hidden_shape)
 
-    Key improvements over one-shot DynamicRegionAssignment:
-      1. Iterative refinement (T rounds of assign -> GRU -> assign)
-      2. Region self-attention after refinement (regions talk to each other)
-      3. Preserves gene-context conditioning (unique to HFlow-ST)
+
+class DynamicRegionAssignment(nn.Module):
+    """
+    Recompute patch-to-region assignments from the current patch state and
+    current gene context, then update region/slide memory recurrently.
     """
 
-    def __init__(self, d_model, n_slots, n_iterations=3, drop=0.0):
+    def __init__(self, d_model, gene_dim, drop=0.0):
         super().__init__()
-        self.n_slots = n_slots
-        self.n_iterations = n_iterations
-
-        # Gene context projection (your unique contribution - keep!)
         self.gene_proj = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(gene_dim, d_model),
             nn.GELU(),
             nn.Dropout(drop),
             nn.Linear(d_model, d_model),
         )
-        self.gene_gate = nn.Parameter(torch.tensor(-2.1972246))  # ~0.1 after sigmoid
-
-        # Slot GRU (iterative refinement)
-        self.slot_gru = nn.GRUCell(d_model, d_model)
-        self.slot_norm = nn.LayerNorm(d_model)
-        self.slot_mlp = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
+        self.region_gate = nn.Sequential(
+            nn.Linear(d_model * 3, d_model),
             nn.GELU(),
             nn.Dropout(drop),
-            nn.Linear(d_model * 4, d_model),
+            nn.Linear(d_model, d_model),
+        )
+        self.slide_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
             nn.Dropout(drop),
+            nn.Linear(d_model, d_model),
         )
+        
+        
+        self.region_gru = nn.GRUCell(d_model, d_model)
+        self.slide_gru = nn.GRUCell(d_model, d_model)
 
-        # Region self-attention (regions exchange information after refinement)
-        self.region_attn = nn.MultiheadAttention(
-            d_model, num_heads=4, batch_first=True, dropout=drop
-        )
-        self.region_attn_norm = nn.LayerNorm(d_model)
-
-    def forward(self, patches, gene_context, slots, pad_mask=None):
-        """
-        Args:
-            patches:       [B, N, d_model]  patch features after spatial attention
-            gene_context:  [B, N, d_model]  gene expression context
-            slots:         [B, K, d_model]  initial region slots
-            pad_mask:      [B, N]           True = padding
-
-        Returns:
-            slots:         [B, K, d_model]  refined region tokens
-            assignment:    [B, N, K]        final patch-to-region assignment
-        """
-        B, N, D = patches.shape
-
-        # Gene-conditioned patch features
-        alpha = torch.sigmoid(self.gene_gate)
-        gene_feats = self.gene_proj(gene_context)
-        patch_input = patches + alpha * gene_feats  # [B, N, D]
-
-        # Gene summary for slot-key conditioning
-        if pad_mask is not None:
-            valid_mask = (~pad_mask).unsqueeze(-1).to(dtype=patches.dtype)
-            gene_summary = (gene_feats * valid_mask).sum(dim=1, keepdim=True) \
-                / valid_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+    def forward(self, patch_batch, region_state, slide_state, gene_context_batch, pad_mask=None):
+        gene_state = self.gene_proj(gene_context_batch)
+        if pad_mask is None:
+            gene_summary = gene_state.mean(dim=1, keepdim=True)
         else:
-            gene_summary = gene_feats.mean(dim=1, keepdim=True)  # [B, 1, D]
+            valid_mask = (~pad_mask).unsqueeze(-1).to(dtype=gene_state.dtype)
+            gene_summary = (gene_state * valid_mask).sum(dim=1, keepdim=True) / valid_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
 
-        # ---- Iterative slot attention refinement ----
-        for _ in range(self.n_iterations):
-            # Attention: patches attend to slots (competition over slots)
-            slot_key = slots + gene_summary  # [B, K, D]
-            attn = torch.matmul(patch_input, slot_key.transpose(-1, -2)) / math.sqrt(D)
-            if pad_mask is not None:
-                attn = attn.masked_fill(pad_mask.unsqueeze(-1), -1e9)
-            attn = F.softmax(attn, dim=-1)  # [B, N, K] - competition over slots
+        patch_query = patch_batch + gene_state
+        region_key = region_state + gene_summary.expand_as(region_state)
+        scores = torch.matmul(patch_query, region_key.transpose(-1, -2)) / math.sqrt(patch_batch.shape[-1])
 
-            # Weighted aggregation: patches -> slots
-            updates = torch.einsum("bnk,bnd->bkd", attn, patches)
-            norm = attn.sum(dim=1).clamp_min(1e-6).unsqueeze(-1)
-            updates = updates / norm
-
-            # GRU + residual MLP refinement
-            slots = self.slot_gru(
-                updates.reshape(-1, D), slots.reshape(-1, D)
-            ).reshape(B, K, D)
-            slots = slots + self.slot_mlp(self.slot_norm(slots))
-
-        # ---- Region Self-Attention: regions exchange information ----
-        slots, _ = self.region_attn(slots, slots, slots)
-        slots = self.region_attn_norm(slots)
-
-        # Final assignment (for cross-scale fusion)
-        slot_key = slots + gene_summary
-        assignment = torch.matmul(patch_input, slot_key.transpose(-1, -2)) / math.sqrt(D)
         if pad_mask is not None:
-            assignment = assignment.masked_fill(pad_mask.unsqueeze(-1), -1e9)
-        assignment = F.softmax(assignment, dim=-1)
+            scores = scores.masked_fill(pad_mask.unsqueeze(-1), -1e9)
 
-        return slots, assignment
+        assignment = F.softmax(scores, dim=-1)
+        if pad_mask is not None:
+            assignment = assignment * (~pad_mask).unsqueeze(-1).to(dtype=assignment.dtype)
+
+        region_mass = assignment.sum(dim=1).clamp_min(1e-6)
+        region_candidate = torch.einsum("bnk,bnd->bkd", assignment, patch_batch)
+        region_candidate = region_candidate / region_mass.unsqueeze(-1)
+        region_candidate = region_candidate + self.region_gate(
+            torch.cat([region_candidate, region_state, gene_summary.expand_as(region_candidate)], dim=-1)
+        )
+
+        region_state = gru_update(self.region_gru, region_state, region_candidate)
+        
+       
+        slide_candidate = region_state.mean(dim=1, keepdim=True)
+        slide_candidate = slide_candidate + self.slide_gate(torch.cat([slide_candidate, gene_summary], dim=-1))
+        slide_state = gru_update(self.slide_gru, slide_state, slide_candidate)
+
+        return region_state, slide_state, assignment
 
 
 def to_dense_batch(x, batch, fill_value=0, max_num_nodes=None):
@@ -285,15 +254,12 @@ class HFlowBlock(nn.Module):
 
     Architecture per block:
         Input: x_t, z_patch, z_region, z_slide, coords, neighbor_indices, batch_idx, pad_mask
-          |
-          +- 1. Spatial Patch Self-Attn (k-NN graph, MLP attention)
-          +- 2. Iterative Slot Attention (gene-conditioned, T iterations)
-          +- 3. Region Self-Attn
-          +- 4. Slide GRU Update
-          +- 5. Cross-scale message passing (direction-dependent)
-          +- 6. Gene velocity prediction from patch tokens
-          |
-          +- Output: velocity_flat, updated z_patch, z_region, z_slide
+          │
+          ├─ 1. Spatial Patch Self-Attn (k-NN graph, MLP attention)
+          ├─ 2. Cross-scale message passing (direction-dependent)
+          ├─ 3. Gene velocity prediction from patch tokens
+          │
+          └─ Output: velocity_flat, updated z_patch, z_region, z_slide
     """
 
     def __init__(
@@ -306,12 +272,10 @@ class HFlowBlock(nn.Module):
         attn_drop=0.0,
         proj_drop=0.0,
         hflow_cross_scale="bidirectional",
-        n_slots=32,
-        n_slot_iterations=3,
     ):
         super().__init__()
 
-        # -- 1. Spatial patch self-attention (k-NN graph, FA-aware) --
+        # ── 1. Spatial patch self-attention (k-NN graph, FA-aware) ──
         self.spatial_attn = SpatialEdgeAggregation(
             d_model=d_model,
             d_edge_model=d_edge_model,
@@ -339,17 +303,12 @@ class HFlowBlock(nn.Module):
 
         self.flow_context_gate = nn.Parameter(torch.tensor(-2.1972246))
         self.velocity_gate = nn.Parameter(torch.tensor(-2.1972246))
-        self.slide_gru = nn.GRUCell(d_model, d_model)
+        self.slide_proj = nn.Linear(d_model, d_model)              # ← add this
+        self.slide_gate_inject = nn.Parameter(torch.tensor(-2.1972246))
+        self.region_norm = nn.LayerNorm(d_model)
+        self.slide_norm = nn.LayerNorm(d_model)
+        self.dynamic_assignment = DynamicRegionAssignment(d_model, d_model, drop=proj_drop)
 
-        # Iterative Slot Attention (replaces one-shot DynamicRegionAssignment)
-        self.region_discovery = IterativeRegionDiscovery(
-            d_model=d_model,
-            n_slots=n_slots,
-            n_iterations=n_slot_iterations,
-            drop=proj_drop,
-        )
-
-        # -- 2. Gene velocity head --
         self.velocity_head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
@@ -361,7 +320,7 @@ class HFlowBlock(nn.Module):
 
         self.cross_scale_direction = hflow_cross_scale
 
-        # -- DIAGNOSTIC CAPTURE (init) --
+
         self._last_region_assignment = None
         self._last_pad_mask = None
 
@@ -401,7 +360,7 @@ class HFlowBlock(nn.Module):
         initial_patch = z_patch_flat
         gene_context = self.flow_context_proj(noisy_exp_flat)
 
-        # -- Step 1: Spatial patch self-attention (k-NN graph) --
+        # ── Step 1: Spatial patch self-attention (k-NN graph) ──
         attn_out = self.spatial_attn(
             noisy_exp_flat, z_patch_flat, coords_flat, neighbor_indices
         )
@@ -438,28 +397,22 @@ class HFlowBlock(nn.Module):
                 z_patch_batch = z_patch_flat.reshape(B, -1, z_patch_flat.shape[-1])
                 gene_context_batch = gene_context.reshape(B, -1, gene_context.shape[-1])
 
-        # -- Step 2: Iterative Slot Attention --
-        z_region, region_assignment = self.region_discovery(
+        z_region, z_slide, region_assignment = self.dynamic_assignment(
             z_patch_batch,
-            gene_context_batch,
             z_region,
+            z_slide,
+            gene_context_batch,
             pad_mask=pad_mask_for_attn,
         )
 
-        # -- Step 3: Slide GRU Update (attention-based, not mean pooling) --
-        slide_candidate = z_region.mean(dim=1, keepdim=True)  # [B, 1, D]
-        # z_slide = self.slide_gru(
-        #     slide_candidate.reshape(-1, slide_candidate.shape[-1]),
-        #     z_slide.reshape(-1, z_slide.shape[-1]),
-        # ).reshape(B, 1, -1)
-
-        z_slide = slide_candidate
-        # -- DIAGNOSTIC CAPTURE (forward) --
+        # ── DIAGNOSTIC CAPTURE (forward) ──
+        # Only stash during eval to avoid retaining graph / memory overhead during training.
         if not self.training:
             self._last_region_assignment = region_assignment.detach()
             self._last_pad_mask = pad_mask_for_attn.detach() if pad_mask_for_attn is not None else None
-
-        # -- Step 4: Cross-scale patch refinement from region memory --
+        slide_signal = self.slide_proj(z_slide)                     # [B, 1, d_model]
+        z_patch_batch = z_patch_batch + torch.sigmoid(self.slide_gate_inject) * slide_signal  # br
+        # ── Cheap patch refinement from current region memory ──
         if direction != "none":
             patch_region = torch.einsum("bnk,bkd->bnd", region_assignment, z_region)
             z_patch_batch = z_patch_batch + patch_region
@@ -473,7 +426,7 @@ class HFlowBlock(nn.Module):
         # Preserve the original patch semantics before the readout head.
         z_patch_flat = z_patch_flat + torch.sigmoid(self.velocity_gate) * initial_patch
 
-        # -- Step 5: Velocity prediction from patch tokens --
+        # ── Velocity prediction from patch tokens ──
         velocity_flat = self.velocity_head(z_patch_flat)
 
         return velocity_flat, z_patch_flat, z_region, z_slide
