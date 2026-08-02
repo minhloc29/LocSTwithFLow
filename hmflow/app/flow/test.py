@@ -64,13 +64,12 @@ def test(args, diffusier, model, loader_list, return_all=False):
                 0.01, 1.0, args.n_sample_steps
             )[:, None].expand(args.n_sample_steps, exp_t1.shape[0]).to(args.device)
 
-            hierarchy_state = None
             pred = None
 
             for step, (t1, t2) in enumerate(zip(ts[:-1], ts[1:])):
                 pred, hierarchy_state = model.inference(
                     exp_t1, img_features, coords,
-                    t1, hierarchy_state=hierarchy_state,
+                    t1
                 )
                 d_t = t2 - t1
 

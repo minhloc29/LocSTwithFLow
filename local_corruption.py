@@ -97,7 +97,6 @@ def evaluate_one_slide_all_settings(
  
     original_valid_mask = (img_features_clean.sum(dim=-1) != 0)
  
-    # Clean baseline
     pred_clean = run_sampling(model, diffusier, img_features_clean, coords, labels, args)
     pcc_c, mse_c, mae_c = compute_metrics(pred_clean, labels.squeeze(0).cpu().numpy())
     rows.append({
@@ -147,8 +146,6 @@ def evaluate_one_slide_all_settings(
                     })
     return rows
  
- 
-# ── Path resolution helpers (new) ───────────────────────────────────────────
  
  
 def discover_split_ids(source_dataroot: str, dataset: str) -> list:
