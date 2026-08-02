@@ -59,7 +59,7 @@ def test(args, diffusier, model, loader_list, return_all=False):
             img_features, coords, labels = batch
             assert img_features.shape[0] == 1, "Batch size must be 1 for inference"
 
-            exp_t1 = diffusier.sample_from_prior(labels.shape).to(args.device)
+            exp_t1 = diffusier.sample_from_prior(labels.shape, labels.device)
             ts = torch.linspace(
                 0.01, 1.0, args.n_sample_steps
             )[:, None].expand(args.n_sample_steps, exp_t1.shape[0]).to(args.device)

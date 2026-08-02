@@ -49,7 +49,6 @@ class GridRegionDiscovery(nn.Module):
         flat_region_embs = torch.zeros(B * self.n_queries, D, device=device)
         flat_counts = torch.zeros(B * self.n_queries, device=device)
 
-        # Flatten to 1D indices for scatter_add_
         flat_batch = torch.arange(B, device=device).unsqueeze(-1).expand(B, N).reshape(-1)
         flat_cell = cell_idx.reshape(-1)
         flat_feats = patch_embs.reshape(-1, D)

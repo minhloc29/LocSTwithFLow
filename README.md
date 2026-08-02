@@ -8,13 +8,19 @@ We recently extended STFlow and released **STPath**, a generative pretrained mod
 
 ## Organization
 
-The organization of this repository is as follows:
-- `app/`: contains the training pipelines for pathology foundation models and STFlow
+The organization of this repository is as follows (all code lives under the `hmflow/` package):
+- `hmflow/app/`: contains the training pipelines for pathology foundation models and flow matching
     - `hest/`: training pipeline for pathology foundation models, mainly from HEST pipeline
-    - `flow/`: training pipeline for STFlow
-- `data/`: contains the dataloader for the STFlow model
-- `model/`: contains the implementation of denoiser
-- `hest_utils/`: contains the utility functions for pathology foundation models, mainly from HEST pipeline
+    - `flow/`: training pipeline for flow matching (including `train.py` and `test.py`)
+- `hmflow/data/`: contains the dataloader for the flow matching model
+- `hmflow/model/`: contains the implementation of the denoiser, including the hierarchical / cross-scale (HFlow) blocks
+- `hmflow/flow/`: contains the interpolant and noise schedules for flow matching
+- `hmflow/hest_utils/`: contains the utility functions for pathology foundation models, mainly from HEST pipeline
+- `hmflow/utils/`: general utilities (random seeding, metrics, result merging)
+- `corruption.py`: reference implementation of local artefact corruption utilities (zero / gaussian / dropout / blur)
+- `local_corruption.py`: robustness evaluation script benchmarking model performance under local morphological corruption
+- `scripts/`: diagnostic and plotting utilities (e.g. retention plots, W2 / OT sanity checks)
+- `results/`: evaluation outputs (corruption, mosaic and STFlow baselines)
 
 
 ## Usage
@@ -40,7 +46,7 @@ hf_hub_download("prov-gigapath/prov-gigapath", filename="pytorch_model.bin", loc
 
 Testing foundation models with the following script, which will save the extracted features in the `embed_dataroot`:
 ```
-$ python app/hest/benchmark.py \
+$ python hmflow/app/hest/benchmark.py \
         --datasets all \
         --encoders uni_v1_official \
         --weights_root /path/to/weights_root \
@@ -49,16 +55,38 @@ $ python app/hest/benchmark.py \
         --batch_size 128
 ```
 
-Training STFlow with the following script:
+Training the flow matching model with the following script:
 ```
-$ python app/flow/train.py \
-        --datasets LUNGS \
+$ python hmflow/app/flow/train.py \
+        --datasets all \
         --feature_encoder uni_v1_official \
         --source_dataroot /path/to/source_dataroot \
         --embed_dataroot /path/to/embed_dataroot \
+        --save_dir results_dir \
         --batch_size 2 \
         --n_layers 4 \
         --n_sample_steps 5
+```
+
+Optionally control the hierarchical (HFlow) representation and cross-scale interactions during training:
+```
+        --hflow_representation slide_region_patch \
+        --hflow_cross_scale bidirectional \
+        --hflow_region_discovery learnable \
+        --n_region_queries 32
+```
+
+Evaluating model robustness under local morphological corruption (zero / gaussian / dropout / blur artefacts) across datasets and splits:
+```
+$ python local_corruption.py \
+        --checkpoint_root /path/to/save_dir \
+        --datasets all \
+        --source_dataroot /path/to/source_dataroot \
+        --embed_dataroot /path/to/embed_dataroot \
+        --representation slide_region_patch \
+        --corruption_types gaussian \
+        --n_corrupt_seeds 3 \
+        --save_dir_root results/corruption_eval
 ```
 
 ## Reference

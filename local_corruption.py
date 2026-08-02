@@ -222,7 +222,6 @@ def run_corruption_evaluation(args: argparse.Namespace) -> pd.DataFrame:
     print(f"[*] {args.dataset}/split{args.split_id} — representation: {args.representation}  "
           f"region_discovery={args.region_discovery})")
  
-    # ── 2. Load checkpoint ────────────────────────────────────────────────
     if args.checkpoint:
         state_dict = torch.load(args.checkpoint, map_location=device)
         state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}

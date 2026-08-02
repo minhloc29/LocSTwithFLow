@@ -57,7 +57,7 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
         ) for sample_id_path in sample_id_paths
     ]
 
-    device = args.device
+    device = args.device if torch.cuda.is_available() else "cpu"
 
     # Build HFlow config from args
     hflow_config = HFlowConfig(
@@ -73,11 +73,12 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
     model = Denoiser(args, hflow_config=hflow_config).to(device)
 
     diffusier = Interpolant(
-        args.prior_sampler, 
+        args.prior_sampler,
         total_count=torch.tensor([args.zinb_total_count]),
         logits=torch.tensor([args.zinb_logits]),
         zi_logits=args.zinb_zi_logits,
         normalize=args.prior_sampler != "gaussian",
+        device=device,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
