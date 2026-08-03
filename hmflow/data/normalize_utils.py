@@ -1,5 +1,4 @@
 import scipy
-import scprep
 import numpy as np
 import scanpy as sc
 import pandas as pd
@@ -59,6 +58,7 @@ def data_augment(adata, fixed, noise_std):
 
 
 def scVGAE_normalize(adata):
+    import scprep  # lazy: scprep is only needed for the scVGAE option
     process_adata = adata.copy()
     process_adata.X = scprep.normalize.library_size_normalize(process_adata.X)
     process_adata.X = scprep.transform.sqrt(process_adata.X)

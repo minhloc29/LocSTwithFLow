@@ -1,8 +1,12 @@
 import torch
 import numpy as np
 import random
-import mygene
 import datetime
+
+try:
+    import mygene
+except ImportError:
+    mygene = None
 
 
 def symbol2ensembl_id(gene_symbol, species='human'):

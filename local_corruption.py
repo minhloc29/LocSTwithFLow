@@ -68,7 +68,7 @@ def run_sampling(
     B = img_features.shape[0]
     assert B == 1, "Batch size must be 1 for inference"
  
-    exp_t1 = diffusier.sample_from_prior(labels.shape).to(args.device)
+    exp_t1 = diffusier.sample_from_prior(labels.shape, labels.device)
     ts = torch.linspace(0.01, 1.0, args.n_sample_steps)[:, None] \
             .expand(args.n_sample_steps, B).to(args.device)
  
@@ -120,7 +120,7 @@ def evaluate_one_slide_all_settings(
                         corrupted, original_valid_mask, ctype
                     )
  
-                    exp_t1 = diffusier.sample_from_prior(labels.shape).to(device)
+                    exp_t1 = diffusier.sample_from_prior(labels.shape, labels.device)
                     ts = torch.linspace(0.01, 1.0, args.n_sample_steps)[:, None] \
                             .expand(args.n_sample_steps, 1).to(device)
                     hierarchy_state = None

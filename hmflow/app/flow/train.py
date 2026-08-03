@@ -7,7 +7,10 @@ from time import time
 from tqdm import tqdm
 from operator import itemgetter
 import torch
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from hmflow.utils import set_random_seed, get_current_time, merge_fold_results
 from hmflow.data.dataset import HESTDatasetPath, MultiHESTDataset, padding_batcher, HESTDataset
 from hmflow.data.normalize_utils import get_normalize_method
@@ -19,6 +22,10 @@ from hmflow.hest_utils.utils import save_pkl
 
 
 def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkpoint_save_dir):
+    if getattr(args, 'model', 'spatial_flow') == 'triplex':
+        from hmflow.app.flow.train_triplex import main as triplex_main
+        return triplex_main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkpoint_save_dir)
+
     normalize_method = get_normalize_method(args.normalize_method)
 
     print("Dataset Loading")
@@ -250,6 +257,31 @@ if __name__ == '__main__':
                         help="Temperature for dynamic region assignments")
     parser.add_argument('--hflow_assignment_entropy_weight', type=float, default=0.1,
                         help="Entropy regularization weight for dynamic assignments")
+
+    # model selection: spatial_flow (default) or triplex (adapted TRIPLEX)
+    parser.add_argument('--model', type=str, default='spatial_flow',
+                        choices=['spatial_flow', 'triplex'],
+                        help="Which model to train: 'spatial_flow' (HFlow/STFlow) or 'triplex'.")
+
+    # TRIPLEX model hyperparameters (defaults mirror TRIPLEX config/ST/andersson/TRIPLEX.yaml)
+    parser.add_argument('--triplex_emb_dim', type=int, default=512)
+    parser.add_argument('--triplex_depth1', type=int, default=1)
+    parser.add_argument('--triplex_depth2', type=int, default=3)
+    parser.add_argument('--triplex_depth3', type=int, default=3)
+    parser.add_argument('--triplex_num_heads1', type=int, default=4)
+    parser.add_argument('--triplex_num_heads2', type=int, default=16)
+    parser.add_argument('--triplex_num_heads3', type=int, default=16)
+    parser.add_argument('--triplex_mlp_ratio1', type=float, default=4)
+    parser.add_argument('--triplex_mlp_ratio2', type=float, default=4)
+    parser.add_argument('--triplex_mlp_ratio3', type=float, default=1)
+    parser.add_argument('--triplex_dropout1', type=float, default=0.2)
+    parser.add_argument('--triplex_dropout2', type=float, default=0.1)
+    parser.add_argument('--triplex_dropout3', type=float, default=0.3)
+    parser.add_argument('--triplex_kernel_size', type=int, default=3)
+    parser.add_argument('--triplex_pos_layer', type=str, default='APEG',
+                        choices=['APEG', 'MLP', 'None', 'spatialformer'])
+    parser.add_argument('--triplex_n_neighbors', type=int, default=25,
+                        help="Number of spatial neighbours per spot (5x5 block = 25).")
     args = parser.parse_args()
 
     args.d_model = args.hidden_dim
