@@ -3,6 +3,72 @@ import numpy as np
 from scipy.stats import pearsonr
 
 
+def spatial_ssim(gt_gene, pred_gene, coords, grid_size=256, method="linear"):
+    """SSIM between the GT and predicted 2D expression maps for one gene.
+
+    gt/pred_gene: [N] per-spot expression for the gene.
+    coords:       [N, 2] spot coordinates in a single slide frame.
+    Rasterizes the irregular spot values into a dense grid via griddata,
+    then computes structural_similarity. Guards constant maps (range ~ 0).
+    """
+    if coords.shape[0] < 4:
+        return float("nan")
+    x = coords[:, 0]; y = coords[:, 1]
+    # Normalize extrema to a stable pixel grid; fall back gracefully if degenerate.
+    if (np.ptp(x) < 1e-9) or (np.ptp(y) < 1e-9):
+        return float("nan")
+    grid_x, grid_y = np.mgrid[
+        x.min():x.max():grid_size * 1j,
+        y.min():y.max():grid_size * 1j,
+    ]
+    from scipy.interpolate import griddata
+    gt_img = griddata(coords, gt_gene, (grid_x, grid_y), method=method)
+    pred_img = griddata(coords, pred_gene, (grid_x, grid_y), method=method)
+    # Fill holes (NaNs outside the convex hull) with the local median / 0.
+    gt_img = np.nan_to_num(gt_img, nan=np.nanmedian(gt_img) if np.isfinite(gt_img).any() else 0.0)
+    pred_img = np.nan_to_num(pred_img, nan=0.0)
+    data_range = float(gt_img.max() - gt_img.min())
+    if data_range < 1e-9:   # constant GT map -> SSIM meaningless
+        return float("nan")
+    from skimage.metrics import structural_similarity
+    return float(structural_similarity(gt_img, pred_img, data_range=data_range))
+
+
+def ssim_metrics(gt, pred, coords, genes, hvg_n=25, grid_size=256):
+    """Per-gene SSIM (SSIM-All) and SSIM over the top-K highly variable genes.
+
+    gt/pred: [N, G]; coords: [N, 2]; genes: list[G].
+    HVG subset is picked by GT variance, so the selection is model-independent.
+    """
+    n_genes = gt.shape[1]
+    var = gt.var(axis=0)
+    hv_idx = np.argsort(-var)[: min(hvg_n, n_genes)]
+    ssim_g, ssim_hvg = [], []
+    for g in range(n_genes):
+        s = spatial_ssim(gt[:, g], pred[:, g], coords, grid_size=grid_size)
+        ssim_g.append(s)
+        if g in hv_idx:
+            ssim_hvg.append(s)
+    ssim_g = np.asarray(ssim_g, dtype=float)
+    ssim_hvg = np.asarray(ssim_hvg, dtype=float)
+
+    def stat(arr):
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return float("nan"), float("nan")
+        return float(arr.mean()), float(arr.std())
+
+    ssim_all_mean, ssim_all_std = stat(ssim_g)
+    ssim_hvg_mean, ssim_hvg_std = stat(ssim_hvg)
+    return {
+        "ssim_all_mean": ssim_all_mean,
+        "ssim_all_std": ssim_all_std,
+        "ssim_hvg_mean": ssim_hvg_mean,
+        "ssim_hvg_std": ssim_hvg_std,
+        "n_hvg": int(len(hv_idx)),
+    }
+
+
 def metric_func(preds_all: np.ndarray, y_test: np.ndarray, genes: list):
     errors = []
     r2_scores = []
@@ -109,6 +175,17 @@ def test(args, diffusier, model, loader_list, return_all=False):
         cur_gt = np.concatenate(cur_gt, axis=0)
         cur_coords_arr = np.concatenate(cur_coords, axis=0)
         cur_res_dict = metric_func(cur_pred, cur_gt, loader.dataset.gene_list)
+        # SSIM is spatial and therefore per-slide: compute on this slide's frame.
+        if getattr(args, "ssim", False):
+            try:
+                cur_res_dict.update(ssim_metrics(
+                    cur_gt, cur_pred, cur_coords_arr,
+                    loader.dataset.gene_list,
+                    hvg_n=getattr(args, "ssim_hvg", 25),
+                    grid_size=getattr(args, "ssim_grid", 256),
+                ))
+            except Exception as e:
+                print(f"[!] SSIM failed for {loader.dataset.name}: {e}")
         cur_res_dict.update({'n_test': len(cur_gt)})
         res_dict[loader.dataset.name] = cur_res_dict
 

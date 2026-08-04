@@ -290,6 +290,14 @@ if __name__ == '__main__':
     parser.add_argument('--hflow_assignment_entropy_weight', type=float, default=0.1,
                         help="Entropy regularization weight for dynamic assignments")
 
+    # SSIM spatial-structure metrics (added to validation)
+    parser.add_argument('--ssim', action='store_true', default=False,
+                        help="Compute per-slide spatial SSIM (SSIM-All and SSIM-HVG) during validation")
+    parser.add_argument('--ssim_grid', type=int, default=256,
+                        help="Rasterization grid size for SSIM maps (e.g. 256)")
+    parser.add_argument('--ssim_hvg', type=int, default=25,
+                        help="Number of highly variable genes (by GT variance) for SSIM-HVG")
+
     # Time-dependent hierarchical fusion gate
     parser.add_argument('--use_time_hierarchy_gate', type=lambda x: x.lower() in ('true', '1', 'yes'),
                         default=True, help="Enable timestep-dependent Patch/Region/Slide modulation")
