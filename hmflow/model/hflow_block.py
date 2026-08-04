@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from hmflow.model.fa import FrameAveraging
+from hmflow.model.hierarchy_time_gate import HierarchyTimeGate
 
 
 def rearrange(x, pattern, **kwargs):
@@ -156,7 +157,8 @@ class SimpleMlp(nn.Module):
 class SpatialEdgeAggregation(FrameAveraging):
     """
     k-NN graph spatial attention with frame averaging.
-    Drop-in replacement for MLPAttnEdgeAggregation that doesn't need timm.
+    d_edge: dimension of edge among nodes
+    
     """
 
     def __init__(
@@ -203,40 +205,87 @@ class SpatialEdgeAggregation(FrameAveraging):
         self.attn_dropout = nn.Dropout(attn_drop)
 
     def forward(self, gene_exp, token_embs, coords, neighbor_indices, neighbor_masks=None):
+        """
+        k-NN spatial attention with frame-averaged edge geometry.
+
+        For every token we compute its message by attending over its k spatial
+        neighbours. Each edge carries: (1) the query token's state (q), (2) the
+        neighbour's key/value states (k/v), (3) frame-averaged relative geometry
+        (rotation + distance), and (4) the gene-expression difference. An MLP
+        scores the concatenation to get neighbour attention weights, which then
+        aggregate both value states and edge geometry in parallel.
+
+        Args:
+            gene_exp:        [n_tokens, n_genes]      current (noisy) gene expression
+            token_embs:      [n_tokens, d_model]      patch/token hidden states (query/key/value source)
+            coords:          [n_tokens, 2]            spatial (x, y) positions of tokens
+            neighbor_indices:[n_tokens, n_neighbors]  per-token indices of nearest neighbours
+            neighbor_masks:  [n_tokens, n_neighbors]  True where a neighbour slot is padding
+
+        Returns:
+            [n_tokens, d_model] aggregated message per token.
+        """
         n_tokens, n_neighbors = token_embs.size(0), neighbor_indices.size(1)
         n_heads, d_head, d_edge_head = self.n_heads, self.d_head, self.d_edge_head
 
-        q_s, k_s, v_s = self.layernorm_qkv(token_embs).chunk(3, dim=-1)
+        # ---- 1. Q/K/V projection -------------------------------------------
+        # layernorm_qkv: LayerNorm + Linear(d_model -> 3*d_model), then chunk
+        # q_s, k_s, v_s: [n_tokens, d_model] each, then per head-reshape:
+        # reshaped q_s/k_s/v_s: [n_tokens, n_heads, d_head]
+        # .chunk(3, dim = -1) split the tensor into 3 chunk, input : [B, N, 3d] -> 3 x [B, N, D]
+        q_s, k_s, v_s = self.layernorm_qkv(token_embs).chunk(3, dim=-1) 
         q_s, k_s, v_s = map(lambda x: rearrange(x, 'n (h d) -> n h d', h=n_heads), (q_s, k_s, v_s))
 
-        """build pairwise representation with FA"""
+        # ---- 2. Pairwise geometric (edge) features with Frame Averaging -----
+        # radial_coords: [n_tokens, n_neighbors, 2]  relative vector from token to each neighbour
         radial_coords = coords[neighbor_indices] - coords.unsqueeze(dim=1)
+        # radial_coord_norm: [n_tokens, n_neighbors, 1]  euclidean distance to each neighbour
         radial_coord_norm = radial_coords.norm(dim=-1).unsqueeze(-1)
 
+        # create_frame returns rotations of radial_coords through n_frames frames:
+        # frame_feats: [n_tokens, n_frames(=4), n_neighbors, 2]
         frame_feats, _, _ = self.create_frame(radial_coords, neighbor_masks)
         frame_feats = frame_feats.view(n_tokens, self.n_frames, n_neighbors, -1)
 
+        # broadcast distance across frames and concatenate with rotated vectors:
+        # [n_tokens, n_frames, n_neighbors, 2+1] -> edge_trans MLP -> d_edge_model,
+        # then average over frames: [n_tokens, n_neighbors, d_edge_model]
         radial_coord_norm = radial_coord_norm.unsqueeze(dim=1).expand(n_tokens, self.n_frames, n_neighbors, -1)
         frame_feats = self.edge_trans(torch.cat([frame_feats, radial_coord_norm], dim=-1)).mean(dim=1)
 
-        """gene expression features"""
+        # ---- 3. Gene-expression (edge) features ------------------------------
+        # gene_exp_diff: [n_tokens, n_neighbors, n_genes] expression diff token vs neighbour
         gene_exp_diff = gene_exp[neighbor_indices] - gene_exp.unsqueeze(dim=1)
+        # gene_exp_feats_expand: [n_tokens, n_neighbors, n_heads, n_genes] (copied per head)
         gene_exp_feats_expand = gene_exp_diff[..., None, :].expand(n_tokens, n_neighbors, n_heads, -1)
 
-        """attention map"""
+        # ---- 4. Attention map (MLP-scored edges) ----------------------------
+        # q_s broadcast over neighbours: [n_tokens, n_neighbors, n_heads, d_head]
         q_s = q_s.unsqueeze(dim=1).expand(n_tokens, n_neighbors, n_heads, d_head)
+        # frame_feats as per head: [n_tokens, n_neighbors, n_heads, d_edge_head]
         frame_feats = frame_feats.view(n_tokens, n_neighbors, n_heads, d_edge_head)
+        # message per edge per head: [n_tokens, n_neighbors, n_heads,
+        #                             d_head( q) + d_head(k) + d_edge_head + n_genes]
         message = torch.cat([q_s, k_s[neighbor_indices], frame_feats, gene_exp_feats_expand], dim=-1)
 
+        # mlp_attn scores each edge -> [n_tokens, n_neighbors, n_heads, 1] -> squeeze
+        # attn_map (pre-softmax): [n_tokens, n_neighbors, n_heads]
         attn_map = self.mlp_attn(message).squeeze(-1)
         if neighbor_masks is not None:
+            # blank out padding neighbours (neighbor_masks unsq -> [n, k, 1])
             attn_map.masked_fill_(neighbor_masks.unsqueeze(dim=-1), -1e9)
+        # transpose to [n_tokens, n_heads, n_neighbors], softmax over neighbours, dropout
         attn_map = self.attn_dropout(nn.Softmax(dim=-1)(attn_map.transpose(1, 2)))
+        # attn_map now: [n_tokens, n_heads, n_neighbors] (weights sum to 1 over neighbours)
 
-        """context aggregation"""
+        # ---- 5. Context aggregation (content + geometry) --------------------
+        # v_s gathered to neighbours: [n_tokens, n_neighbors, n_heads, d_head]
         v_s_neighs = v_s[neighbor_indices].view(n_tokens, -1, n_heads, d_head)
+        # scalar_context: attn-weighted sum of values -> [n_tokens, n_heads, d_head] -> [n_tokens, d_model]
         scalar_context = einsum(attn_map, v_s_neighs, 'n h m, n m h d -> n h d').view(n_tokens, -1)
+        # edge_context:   attn-weighted sum of frame features -> [n_tokens, d_edge_model]
         edge_context = einsum(attn_map, frame_feats, 'n h m, n m h d -> n h d').view(n_tokens, -1)
+        # concatenate content and geometry, project back to d_model
         return self.W_output(torch.cat([scalar_context, edge_context], dim=-1))
 
 
@@ -264,6 +313,9 @@ class HFlowBlock(nn.Module):
         attn_drop=0.0,
         proj_drop=0.0,
         hflow_cross_scale="bidirectional",
+        use_time_hierarchy_gate=True,
+        gate_mode="learnable",
+        gate_hidden=128,
     ):
         super().__init__()
 
@@ -310,9 +362,33 @@ class HFlowBlock(nn.Module):
 
         self.cross_scale_direction = hflow_cross_scale
 
+        # ── Time-dependent hierarchical fusion gate ──
+        self.use_time_hierarchy_gate = use_time_hierarchy_gate
+        self.gate_mode = gate_mode if use_time_hierarchy_gate else "static"
+        if self.gate_mode == "learnable":
+            self.hierarchy_gate = HierarchyTimeGate(gate_hidden)
+        else:
+            self.hierarchy_gate = None
 
         self._last_region_assignment = None
         self._last_pad_mask = None
+
+    def _gate_weights(self, t):
+        """Return (w_patch, w_region, w_slide) each [B] for the given timestep t."""
+        B = t.shape[0] if t.ndim else 1
+        dev, dt = t.device, t.dtype
+        if self.gate_mode == "static":
+            ones = torch.ones(B, device=dev, dtype=dt)
+            return ones, ones, ones
+        if self.gate_mode == "fixed":
+            tf = t.float()
+            slide = tf
+            patch = 1.0 - tf
+            region = 4.0 * tf * (1.0 - tf)
+            s = slide + patch + region
+            return patch / s, region / s, slide / s
+        # learnable
+        return self.hierarchy_gate(t)
 
     def forward(
         self,
@@ -325,6 +401,7 @@ class HFlowBlock(nn.Module):
         batch_idx,
         pad_mask=None,
         max_n_cells=None,
+        t=None,
     ):
         """
         Args:
@@ -337,6 +414,7 @@ class HFlowBlock(nn.Module):
             batch_idx:        [N_total]
             pad_mask:         [B, N_max]  True = padding
             max_n_cells:      int
+            t:                [B]  flow timestep (used only by the hierarchy gate)
 
         Returns:
             velocity_flat:  [N_total, n_genes]
@@ -350,14 +428,12 @@ class HFlowBlock(nn.Module):
         initial_patch = z_patch_flat
         gene_context = self.flow_context_proj(noisy_exp_flat)
 
-        # ── Step 1: Spatial patch self-attention (k-NN graph) ──
         attn_out = self.spatial_attn(
             noisy_exp_flat, z_patch_flat, coords_flat, neighbor_indices
         )
         z_patch_flat = self.spatial_norm(z_patch_flat + attn_out)
         z_patch_flat = self.spatial_norm2(z_patch_flat + self.spatial_mlp(z_patch_flat))
 
-        # Keep the current noisy expression visible to the hierarchy.
         flow_alpha = torch.sigmoid(self.flow_context_gate)
         z_patch_flat = z_patch_flat + flow_alpha * gene_context
 
@@ -399,11 +475,25 @@ class HFlowBlock(nn.Module):
             self._last_region_assignment = region_assignment.detach()
             self._last_pad_mask = pad_mask_for_attn.detach() if pad_mask_for_attn is not None else None
         slide_signal = self.slide_proj(z_slide)                     # [B, 1, d_model]
-        z_patch_batch = z_patch_batch + torch.sigmoid(self.slide_gate_inject) * slide_signal  # br
+
+        # ── Time-dependent hierarchical fusion gate ──
+        # Gates how strongly slide / region context feeds the patch prediction.
+        # w_slide, w_region: [B] -> broadcast to [B, 1, 1]. Patch residual unchanged.
+        w_patch_b, w_region_b, w_slide_b = self._gate_weights(t)
+        w_slide_ = w_slide_b[:, None, None]
+        w_region_ = w_region_b[:, None, None]
+
+        if not self.training:
+            self._last_gate_weights = (
+                w_patch_b.detach(), w_region_b.detach(), w_slide_b.detach())
+            self._last_gate_t = t.detach()
+
+        # slide -> patch (gate the existing sigmoid-controlled injection)
+        z_patch_batch = z_patch_batch + w_slide_ * torch.sigmoid(self.slide_gate_inject) * slide_signal
 
         if direction != "none":
             patch_region = torch.einsum("bnk,bkd->bnd", region_assignment, z_region)
-            z_patch_batch = z_patch_batch + patch_region
+            z_patch_batch = z_patch_batch + w_region_ * patch_region
 
             if pad_mask is not None:
                 z_patch_flat = z_patch_batch[~pad_mask]

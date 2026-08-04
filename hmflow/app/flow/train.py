@@ -76,8 +76,20 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
         hflow_region_discovery=args.hflow_region_discovery,
         hflow_assignment_temperature=args.hflow_assignment_temperature,
         hflow_assignment_entropy_weight=args.hflow_assignment_entropy_weight,
+        use_time_hierarchy_gate=args.use_time_hierarchy_gate,
+        gate_mode=args.gate_mode,
+        gate_hidden=args.gate_hidden,
     )
     model = Denoiser(args, hflow_config=hflow_config).to(device)
+
+    # ── Complexity accounting for the hierarchy gate ──
+    gate_params = sum(
+        p.numel() for b in model.blocks for n, p in b.named_parameters()
+        if "hierarchy_gate" in n
+    ) if hasattr(model, "blocks") else 0
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"[*] Hierarchy gate extra params: {gate_params} "
+          f"({100.0 * gate_params / total_params:.4f}% of total)" if total_params else "")
 
     diffusier = Interpolant(
         args.prior_sampler,
@@ -257,6 +269,15 @@ if __name__ == '__main__':
                         help="Temperature for dynamic region assignments")
     parser.add_argument('--hflow_assignment_entropy_weight', type=float, default=0.1,
                         help="Entropy regularization weight for dynamic assignments")
+
+    # Time-dependent hierarchical fusion gate
+    parser.add_argument('--use_time_hierarchy_gate', type=lambda x: x.lower() in ('true', '1', 'yes'),
+                        default=True, help="Enable timestep-dependent Patch/Region/Slide fusion gate")
+    parser.add_argument('--gate_mode', type=str, default='learnable',
+                        choices=['static', 'fixed', 'learnable'],
+                        help="Gate mode: 'static' (current), 'fixed' (analytic schedule), 'learnable' (MLP gate)")
+    parser.add_argument('--gate_hidden', type=int, default=128,
+                        help="Hidden dim of the learnable hierarchy gate MLP")
 
     # model selection: spatial_flow (default) or triplex (adapted TRIPLEX)
     parser.add_argument('--model', type=str, default='spatial_flow',

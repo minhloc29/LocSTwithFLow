@@ -51,6 +51,12 @@ def test(args, diffusier, model, loader_list, return_all=False):
     res_dict = {}
     capture_regions = hasattr(model, '_last_region_assignment') or True  # try regardless; guarded below
 
+    # ---- Hierarchy gate logging (timestep-dependent weights) ----
+    # The gate weights are identical across blocks (same t), so log block 0.
+    gate_t, gate_a = [], []  # (t, (mean_patch, mean_region, mean_slide))
+    block0 = model.blocks[0] if hasattr(model, "blocks") and len(model.blocks) else None
+    has_gate = bool(getattr(block0, "hierarchy_gate", None) or getattr(block0, "gate_mode", "static") != "static")
+
     for loader in loader_list:
         cur_pred, cur_gt, cur_coords, cur_region = [], [], [], []
 
@@ -71,6 +77,14 @@ def test(args, diffusier, model, loader_list, return_all=False):
                     exp_t1, img_features, coords,
                     t1
                 )
+                if has_gate and block0 is not None:
+                    gw = getattr(block0, "_last_gate_weights", None)
+                    gt = getattr(block0, "_last_gate_t", None)
+                    if gw is not None and gt is not None:
+                        gate_t.append(float(gt.squeeze().mean().item()))
+                        gate_a.append((float(gw[0].mean().item()),
+                                       float(gw[1].mean().item()),
+                                       float(gw[2].mean().item())))
                 d_t = t2 - t1
 
                 if step == args.n_sample_steps - 2:
@@ -131,6 +145,22 @@ def test(args, diffusier, model, loader_list, return_all=False):
             dump['region_assignments_all'] = None
             print("Note: region_assignments not captured — apply patch_capture_diagnostics.py first "
                   "if you want the region-tissue correspondence analysis.")
+
+        if gate_t:
+            dump['gate_t'] = gate_t
+            dump['gate_weights'] = gate_a   # list of (mean_patch, mean_region, mean_slide)
+            # Save a standalone npz for plotting gate_curve without re-running inference.
+            try:
+                import os
+                npz_path = os.path.join(getattr(args, 'val_save_dir', None) or '.', 'gate_log.npz')
+                np.savez(
+                    npz_path,
+                    gate_t=np.asarray(gate_t, dtype=np.float32),
+                    gate_weights=np.asarray(gate_a, dtype=np.float32),
+                )
+                print(f"[*] Saved hierarchy gate log -> {npz_path}")
+            except Exception as e:  # plotting must never break validation
+                print(f"[!] Failed to save gate log: {e}")
         return res_dict, dump
 
     return res_dict

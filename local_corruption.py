@@ -225,7 +225,13 @@ def run_corruption_evaluation(args: argparse.Namespace) -> pd.DataFrame:
     if args.checkpoint:
         state_dict = torch.load(args.checkpoint, map_location=device)
         state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
-        model.load_state_dict(state_dict, strict=True)  # will fail loudly on config mismatch
+        # Backward compatible: gate weights may be absent in old checkpoints.
+        # Those keys stay at neutral init (zero-init -> 1/3 each for learned).
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"[*] Missing keys (neutral/zero init, likely hierarchy gate): {missing}")
+        if unexpected:
+            print(f"[!] Unexpected keys ignored: {len(unexpected)}")
         print(f"[*] Loaded checkpoint: {args.checkpoint}")
     else:
         print("[!] No checkpoint provided — using randomly initialized model")

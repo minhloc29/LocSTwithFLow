@@ -16,6 +16,11 @@ class HFlowConfig:
     hflow_assignment_temperature: float = 1.0
     hflow_assignment_entropy_weight: float = 0.0
 
+    # Time-dependent hierarchical fusion gate
+    use_time_hierarchy_gate: bool = True
+    gate_mode: str = "learnable"   # "static" | "fixed" | "learnable"
+    gate_hidden: int = 128
+
     def __post_init__(self):
         valid_repr = {"flat", "slide_patch", "slide_region_patch"}
         assert self.hflow_representation in valid_repr, \
@@ -28,3 +33,7 @@ class HFlowConfig:
         valid_rd = {"learnable", "grid", "kmeans", "assignment"}
         assert self.hflow_region_discovery in valid_rd, \
             f"hflow_region_discovery must be one of {valid_rd}, got '{self.hflow_region_discovery}'"
+
+        valid_gm = {"static", "fixed", "learnable"}
+        assert self.gate_mode in valid_gm, \
+            f"gate_mode must be one of {valid_gm}, got '{self.gate_mode}'"

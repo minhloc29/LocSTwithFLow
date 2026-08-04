@@ -75,6 +75,9 @@ class HFlowDenoiser(nn.Module):
                     attn_drop=model_config.attn_dropout,
                     proj_drop=model_config.dropout,
                     hflow_cross_scale=hflow_config.hflow_cross_scale,
+                    use_time_hierarchy_gate=hflow_config.use_time_hierarchy_gate,
+                    gate_mode=hflow_config.gate_mode,
+                    gate_hidden=hflow_config.gate_hidden,
                 )
                 for _ in range(model_config.n_layers)
             ])
@@ -192,6 +195,7 @@ class HFlowDenoiser(nn.Module):
                 batch_idx=batch_idx,
                 pad_mask=pad_mask,
                 max_n_cells=N_cells,
+                t=t_steps,
             )
             block_velocities.append(velocity_flat)
 
