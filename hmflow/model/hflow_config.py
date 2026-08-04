@@ -18,7 +18,8 @@ class HFlowConfig:
 
     # Time-dependent hierarchical fusion gate
     use_time_hierarchy_gate: bool = True
-    gate_mode: str = "learnable"   # "static" | "fixed" | "learnable"
+    modulation_mode: str = "adaln"   # "static" | "scalar" | "adaln"
+    gate_mode: str = "learnable"     # legacy scalar-gate mode (scalar ablation)
     gate_hidden: int = 128
 
     def __post_init__(self):
@@ -37,3 +38,7 @@ class HFlowConfig:
         valid_gm = {"static", "fixed", "learnable"}
         assert self.gate_mode in valid_gm, \
             f"gate_mode must be one of {valid_gm}, got '{self.gate_mode}'"
+
+        valid_mm = {"static", "scalar", "adaln"}
+        assert self.modulation_mode in valid_mm, \
+            f"modulation_mode must be one of {valid_mm}, got '{self.modulation_mode}'"

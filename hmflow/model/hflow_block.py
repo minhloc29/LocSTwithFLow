@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from hmflow.model.fa import FrameAveraging
 from hmflow.model.hierarchy_time_gate import HierarchyTimeGate
+from hmflow.model.hierarchy_adaln import HierarchyAdaLN
 
 
 def rearrange(x, pattern, **kwargs):
@@ -314,6 +315,7 @@ class HFlowBlock(nn.Module):
         proj_drop=0.0,
         hflow_cross_scale="bidirectional",
         use_time_hierarchy_gate=True,
+        modulation_mode="adaln",
         gate_mode="learnable",
         gate_hidden=128,
     ):
@@ -362,22 +364,37 @@ class HFlowBlock(nn.Module):
 
         self.cross_scale_direction = hflow_cross_scale
 
-        # ── Time-dependent hierarchical fusion gate ──
+        # ── Time-dependent hierarchical modulation (scalar gate / AdaLN) ──
         self.use_time_hierarchy_gate = use_time_hierarchy_gate
-        self.gate_mode = gate_mode if use_time_hierarchy_gate else "static"
-        if self.gate_mode == "learnable":
-            self.hierarchy_gate = HierarchyTimeGate(gate_hidden)
-        else:
+        self.gate_mode = gate_mode  # legacy scalar-gate mode ('static'/'fixed'/'learnable')
+        self.modulation_mode = modulation_mode if use_time_hierarchy_gate else "static"
+        if self.modulation_mode == "adaln":
+            self.hierarchy_adaln = HierarchyAdaLN(d_model, time_dim=d_model)
             self.hierarchy_gate = None
+        elif self.modulation_mode == "scalar":
+            self.hierarchy_adaln = None
+            self.hierarchy_gate = HierarchyTimeGate(gate_hidden)
+        else:  # static
+            self.hierarchy_adaln = None
+            self.hierarchy_gate = None
+
+        # Per-level LayerNorms used by AdaLN (modulate before cross-scale fusion).
+        self.patch_adaln_norm = nn.LayerNorm(d_model)
+        self.region_adaln_norm = nn.LayerNorm(d_model)
+        self.slide_adaln_norm = nn.LayerNorm(d_model)
 
         self._last_region_assignment = None
         self._last_pad_mask = None
 
     def _gate_weights(self, t):
-        """Return (w_patch, w_region, w_slide) each [B] for the given timestep t."""
+        """Return (w_patch, w_region, w_slide) each [B] for the given timestep t.
+
+        Only used by the 'static'/'fixed' scalar paths; the AdaLN path computes
+        per-feature scale/shift/gate instead and does not call this.
+        """
         B = t.shape[0] if t.ndim else 1
         dev, dt = t.device, t.dtype
-        if self.gate_mode == "static":
+        if self.modulation_mode == "static":
             ones = torch.ones(B, device=dev, dtype=dt)
             return ones, ones, ones
         if self.gate_mode == "fixed":
@@ -387,7 +404,7 @@ class HFlowBlock(nn.Module):
             region = 4.0 * tf * (1.0 - tf)
             s = slide + patch + region
             return patch / s, region / s, slide / s
-        # learnable
+        # scalar learnable gate
         return self.hierarchy_gate(t)
 
     def forward(
@@ -402,6 +419,7 @@ class HFlowBlock(nn.Module):
         pad_mask=None,
         max_n_cells=None,
         t=None,
+        t_emb=None,
     ):
         """
         Args:
@@ -414,7 +432,8 @@ class HFlowBlock(nn.Module):
             batch_idx:        [N_total]
             pad_mask:         [B, N_max]  True = padding
             max_n_cells:      int
-            t:                [B]  flow timestep (used only by the hierarchy gate)
+            t:                [B]  flow timestep (scalar gate / fixed schedule)
+            t_emb:            [B, d_model]  fourier time embedding (AdaLN)
 
         Returns:
             velocity_flat:  [N_total, n_genes]
@@ -474,31 +493,59 @@ class HFlowBlock(nn.Module):
         if not self.training:
             self._last_region_assignment = region_assignment.detach()
             self._last_pad_mask = pad_mask_for_attn.detach() if pad_mask_for_attn is not None else None
-        slide_signal = self.slide_proj(z_slide)                     # [B, 1, d_model]
 
-        # ── Time-dependent hierarchical fusion gate ──
-        # Gates how strongly slide / region context feeds the patch prediction.
-        # w_slide, w_region: [B] -> broadcast to [B, 1, 1]. Patch residual unchanged.
-        w_patch_b, w_region_b, w_slide_b = self._gate_weights(t)
-        w_slide_ = w_slide_b[:, None, None]
-        w_region_ = w_region_b[:, None, None]
+        # ── Time-dependent hierarchical modulation ──
+        # AdaLN (proposed): per-level scale/shift/gate conditioned on t_emb.
+        #   Region/Slide are LN+scale+shift modulated before use as context.
+        #   Patch is the residual stream: LN+scale+shift, then gates scale the
+        #   two cross-scale additions (slide->patch, region->patch).
+        # AdaLN-Zero init means g=0, 1+scale=1, shift=0 -> identity at start.
+        if self.modulation_mode == "adaln" and t_emb is not None:
+            p = self.hierarchy_adaln(t_emb)  # {lvl: (scale[B,d], shift[B,d], gate[B,1])}
+            (s_p, sh_p, g_p), (s_r, sh_r, g_r), (s_s, sh_s, g_s) = \
+                p["patch"], p["region"], p["slide"]
 
-        if not self.training:
-            self._last_gate_weights = (
-                w_patch_b.detach(), w_region_b.detach(), w_slide_b.detach())
-            self._last_gate_t = t.detach()
+            # Modulate region/slide context before cross-scale use.
+            z_region_mod = self.region_adaln_norm(z_region) * (1 + s_r[:, None, :]) + sh_r[:, None, :]
+            z_slide_mod = self.slide_adaln_norm(z_slide) * (1 + s_s[:, None, :]) + sh_s[:, None, :]
 
-        # slide -> patch (gate the existing sigmoid-controlled injection)
-        z_patch_batch = z_patch_batch + w_slide_ * torch.sigmoid(self.slide_gate_inject) * slide_signal
+            # slide -> patch (AdaLN gate on the sigmoid-controlled injection)
+            slide_signal = self.slide_proj(z_slide_mod)
+            z_patch_batch = z_patch_batch + g_s[:, :, None] * torch.sigmoid(self.slide_gate_inject) * slide_signal
 
-        if direction != "none":
-            patch_region = torch.einsum("bnk,bkd->bnd", region_assignment, z_region)
-            z_patch_batch = z_patch_batch + w_region_ * patch_region
+            # Patch residual stream: LN + scale/shift before accumulating context.
+            z_patch_batch = self.patch_adaln_norm(z_patch_batch) * (1 + s_p[:, None, :]) + sh_p[:, None, :]
 
-            if pad_mask is not None:
-                z_patch_flat = z_patch_batch[~pad_mask]
-            else:
-                z_patch_flat = z_patch_batch[valid_mask]
+            if direction != "none":
+                patch_region = torch.einsum("bnk,bkd->bnd", region_assignment, z_region_mod)
+                z_patch_batch = z_patch_batch + g_r[:, :, None] * patch_region
+
+                if pad_mask is not None:
+                    z_patch_flat = z_patch_batch[~pad_mask]
+                else:
+                    z_patch_flat = z_patch_batch[valid_mask]
+        else:
+            # Scalar gate (previous behavior): one softmax weight per level.
+            slide_signal = self.slide_proj(z_slide)
+            w_patch_b, w_region_b, w_slide_b = self._gate_weights(t)
+            w_slide_ = w_slide_b[:, None, None]
+            w_region_ = w_region_b[:, None, None]
+
+            if not self.training:
+                self._last_gate_weights = (
+                    w_patch_b.detach(), w_region_b.detach(), w_slide_b.detach())
+                self._last_gate_t = t.detach()
+
+            z_patch_batch = z_patch_batch + w_slide_ * torch.sigmoid(self.slide_gate_inject) * slide_signal
+
+            if direction != "none":
+                patch_region = torch.einsum("bnk,bkd->bnd", region_assignment, z_region)
+                z_patch_batch = z_patch_batch + w_region_ * patch_region
+
+                if pad_mask is not None:
+                    z_patch_flat = z_patch_batch[~pad_mask]
+                else:
+                    z_patch_flat = z_patch_batch[valid_mask]
 
         z_patch_flat = z_patch_flat + torch.sigmoid(self.velocity_gate) * initial_patch
 

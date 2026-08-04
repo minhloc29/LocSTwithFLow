@@ -77,19 +77,39 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
         hflow_assignment_temperature=args.hflow_assignment_temperature,
         hflow_assignment_entropy_weight=args.hflow_assignment_entropy_weight,
         use_time_hierarchy_gate=args.use_time_hierarchy_gate,
+        modulation_mode=args.modulation_mode,
         gate_mode=args.gate_mode,
         gate_hidden=args.gate_hidden,
     )
     model = Denoiser(args, hflow_config=hflow_config).to(device)
 
-    # ── Complexity accounting for the hierarchy gate ──
-    gate_params = sum(
-        p.numel() for b in model.blocks for n, p in b.named_parameters()
-        if "hierarchy_gate" in n
-    ) if hasattr(model, "blocks") else 0
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"[*] Hierarchy gate extra params: {gate_params} "
-          f"({100.0 * gate_params / total_params:.4f}% of total)" if total_params else "")
+    # ── Complexity accounting for the hierarchical modulation ──
+    if hasattr(model, "blocks"):
+        mod_params = sum(
+            p.numel() for b in model.blocks for n, p in b.named_parameters()
+            if "hierarchy_adaln" in n or "hierarchy_gate" in n
+        )
+        ln_params = sum(
+            p.numel() for b in model.blocks for n, p in b.named_parameters()
+            if "_adaln_norm" in n
+        )
+        extra = mod_params + ln_params
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"[*] Modulation extra params: {extra} (+{ln_params} LN) "
+              f"({100.0 * extra / total_params:.4f}% of total)" if total_params else "")
+
+        # Extra FLOPs from the modulation MLPs (2 * out * in MACs, per block per step).
+        extra_flops = 0
+        for b in model.blocks:
+            for name, g in (("hierarchy_adaln", getattr(b, "hierarchy_adaln", None)),
+                            ("hierarchy_gate", getattr(b, "hierarchy_gate", None))):
+                if g is None:
+                    continue
+                for m in g.modules():
+                    if isinstance(m, torch.nn.Linear):
+                        extra_flops += 2 * m.out_features * m.in_features
+        if extra_flops:
+            print(f"[*] Modulation extra FLOPs (per block, per timestep): {extra_flops:,}")
 
     diffusier = Interpolant(
         args.prior_sampler,
@@ -272,12 +292,16 @@ if __name__ == '__main__':
 
     # Time-dependent hierarchical fusion gate
     parser.add_argument('--use_time_hierarchy_gate', type=lambda x: x.lower() in ('true', '1', 'yes'),
-                        default=True, help="Enable timestep-dependent Patch/Region/Slide fusion gate")
+                        default=True, help="Enable timestep-dependent Patch/Region/Slide modulation")
+    parser.add_argument('--modulation_mode', type=str, default='adaln',
+                        choices=['static', 'scalar', 'adaln'],
+                        help="Modulation mode: 'static' (original), 'scalar' (softmax gate), "
+                             "'adaln' (per-level scale/shift/gate, proposed)")
     parser.add_argument('--gate_mode', type=str, default='learnable',
                         choices=['static', 'fixed', 'learnable'],
-                        help="Gate mode: 'static' (current), 'fixed' (analytic schedule), 'learnable' (MLP gate)")
+                        help="Legacy scalar-gate mode (only used when modulation_mode='scalar')")
     parser.add_argument('--gate_hidden', type=int, default=128,
-                        help="Hidden dim of the learnable hierarchy gate MLP")
+                        help="Hidden dim of the (legacy) scalar hierarchy gate MLP")
 
     # model selection: spatial_flow (default) or triplex (adapted TRIPLEX)
     parser.add_argument('--model', type=str, default='spatial_flow',
