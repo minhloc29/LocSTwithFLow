@@ -22,65 +22,61 @@ from hmflow.app.flow.test import test
 from hmflow.hest_utils.utils import save_pkl
 
 
-def adjoint_train_step(args, diffusier, model, img_features, coords, gene_exp):
-    """CAM-style flow-matching training step.
+def trajectory_gene_loss(args, diffusier, model, img_features, coords, gene_exp):
+    """CAM-style deep supervision over a sampled denoising trajectory.
 
-    Samples ONE denoising trajectory (noise -> data) with T Euler steps, keeps every
-    state x_t and velocity v_t, evaluates a gene objective ONLY at the terminal state,
-    computes the adjoint d(gene_loss)/d(x_t) via autograd for every state, then adds an
-    auxiliary trajectory loss that pushes each velocity toward decreasing gene_loss.
+    Samples one noise -> data trajectory (T Euler steps) and decodes the gene
+    prediction at EVERY intermediate state, returning a (weighted) mean of the gene
+    objective over the steps. This directly tests whether supervising intermediate
+    states with the final biological objective helps, without inventing a velocity/
+    adjoint objective (the flow-matching loss itself is left unchanged).
 
-    Returns (loss, fm_loss, traj_loss) where loss = fm_loss + lambda * traj_loss.
+    The model's output already is the gene prediction in the flat representation
+    (and the terminal gene prediction in the hierarchical one), so this is the
+    "only one decoder" note from the design: the same head is applied at each state.
+
+    Each step is decoded from a *detached* state (``x.detach()``), so gradient flows
+    locally into the model's decoder at that time — memory stays O(1) per step rather
+    than retaining a T-deep ODE graph.
     """
     B = gene_exp.shape[0]
     device = gene_exp.device
     T = args.n_traj_steps
     shape = gene_exp.shape
-
-    # descending time schedule [1.0 -> t_min], T+1 points -> T steps
-    t_min = 1e-3
-    ts = torch.linspace(1.0, t_min, T + 1, device=device)   # [T+1]
-    dts = ts[:-1] - ts[1:]                                  # [T] positive, descending
-
     pad_mask = img_features.sum(-1) == 0
+    gt = gene_exp[~pad_mask]
 
-    x = diffusier.sample_from_prior(shape, device)          # start at noise (t=1)
-    states, velocities, preds = [], [], []
+    t_min = 1e-3
+    t_max = 1.0 - t_min
+    ts = torch.linspace(t_max, t_min, T + 1, device=device)
+    dts = ts[:-1] - ts[1:]
+
+    x = diffusier.sample_from_prior(shape, device)          # start at noise (t~1)
+    gene_losses = []
 
     for s in range(T):
-        t_s = ts[s].expand(B)                               # [B]
-        pred = model.inference(x, img_features, coords, t_s)[0]   # [B, N, G] data prediction
+        t_s = ts[s].expand(B)
+        pred = model.inference(x, img_features, coords, t_s)[0]     # [B, N, G]
         d_t = dts[s].expand(B)
-        v = (pred - x) / (1.0 - t_s[:, None, None].clamp(min=t_min))  # rectified velocity
-        states.append(x)
-        velocities.append(v)
-        preds.append(pred)
-        x = diffusier.denoise(pred, x, t_s, d_t)            # Euler step to smaller t
+        y_hat = pred[~pad_mask]
+        if args.gene_loss == "pearson":
+            gl = pcc_loss(y_hat, gt)
+        else:
+            gl = torch.nn.functional.mse_loss(y_hat, gt)
+        gene_losses.append(gl)
+        # Euler step to the next (smaller-t) state; detach so each decode is an
+        # independent deep-supervision target (no ODE-chain backprop, O(1) memory).
+        x = diffusier.denoise(pred, x, t_s, d_t).detach()
 
-    # 1) flow-matching loss on the trajectory grid: mean MSE(pred, gt) over steps
-    gt = gene_exp[~pad_mask]
-    fm_loss = torch.stack([p[~pad_mask] for p in preds]).sub(gt).square().mean()
-
-    # 2) terminal gene objective (decode ONLY the terminal state's prediction)
-    y_hat = preds[-1][~pad_mask]
-    y_gt = gt
-    if args.gene_loss == "pearson":
-        gene_loss = pcc_loss(y_hat, y_gt)
+    gene_losses = torch.stack(gene_losses)
+    weights = getattr(args, "traj_step_weights", None)
+    if weights is not None:
+        w = torch.as_tensor(weights, dtype=gene_losses.dtype, device=device)
+        w = w / w.sum()   # normalize so the sum is a weighted mean
+        traj_gene_loss = (gene_losses * w).sum()
     else:
-        gene_loss = torch.nn.functional.mse_loss(y_hat, y_gt)
-
-    # 3) adjoint: d(gene_loss)/d(each trajectory state), retain the graph
-    adjoints = torch.autograd.grad(
-        gene_loss, states, retain_graph=True, create_graph=False
-    )
-
-    # 4) trajectory loss: push each velocity toward decreasing gene_loss (adjoint detached)
-    traj_loss = torch.zeros((), device=device)
-    for v, a in zip(velocities, adjoints):
-        traj_loss = traj_loss - (v * a.detach()).sum() / v.numel()
-
-    loss = fm_loss + args.traj_lambda * traj_loss
-    return loss, fm_loss, traj_loss
+        traj_gene_loss = gene_losses.mean()
+    return traj_gene_loss
 
 
 def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkpoint_save_dir):
@@ -195,26 +191,28 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
             batch = [x.to(device) for x in batch]
             img_features, coords, gene_exp = batch
 
-            # CAM-style training: sample a trajectory, decode terminal gene objective,
-            # backprop the adjoint trajectory loss + flow-matching loss.
-            optimizer.zero_grad(set_to_none=True)
-            if args.use_adjoint:
-                loss, fm_loss, traj_loss = adjoint_train_step(
+            # Original STFlow flow-matching step — kept exactly unchanged.
+            noisy_exp, t_steps = diffusier.corrupt_exp(gene_exp)
+            pred_exp, fm_loss = model(
+                exp=noisy_exp,
+                img_features=img_features,
+                coords=coords,
+                labels=gene_exp,
+                t_steps=t_steps
+            )
+
+            # CAM-style deep supervision: additionally decode gene predictions along a
+            # sampled denoising trajectory and add a weighted gene objective.
+            if args.use_deep_supervision:
+                traj_gene_loss = trajectory_gene_loss(
                     args, diffusier, model, img_features, coords, gene_exp
                 )
+                loss = fm_loss + args.traj_lambda * traj_gene_loss
             else:
-                # original single-step flow matching
-                noisy_exp, t_steps = diffusier.corrupt_exp(gene_exp)
-                pred_exp, fm_loss = model(
-                    exp=noisy_exp,
-                    img_features=img_features,
-                    coords=coords,
-                    labels=gene_exp,
-                    t_steps=t_steps
-                )
-                traj_loss = torch.zeros_like(fm_loss)
+                traj_gene_loss = torch.zeros_like(fm_loss)
                 loss = fm_loss
 
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
             optimizer.step()
@@ -223,7 +221,7 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
                 wandb.log({
                     f"{args.dataset}/Train/{split_id}/loss": loss.cpu().item(),
                     f"{args.dataset}/Train/{split_id}/fm_loss": fm_loss.cpu().item(),
-                    f"{args.dataset}/Train/{split_id}/traj_loss": (args.traj_lambda * traj_loss).cpu().item(),
+                    f"{args.dataset}/Train/{split_id}/traj_gene_loss": traj_gene_loss.cpu().item(),
                 })
 
             avg_loss += loss.cpu().item()
@@ -386,17 +384,22 @@ if __name__ == '__main__':
                         choices=['spatial_flow', 'triplex'],
                         help="Which model to train: 'spatial_flow' (HFlow/STFlow) or 'triplex'.")
 
-    # CAM-style adjoint / trajectory-loss regularization
-    parser.add_argument('--use_adjoint', type=lambda x: x.lower() in ('true', '1', 'yes'),
-                        default=True,
-                        help="Enable CAM-style trajectory sampling + adjoint trajectory loss.")
+    # CAM-style deep supervision over the denoising trajectory
+    parser.add_argument('--use_deep_supervision', type=lambda x: x.lower() in ('true', '1', 'yes'),
+                        default=False,
+                        help="Sample a denoising trajectory and add a weighted gene "
+                             "objective decoded at every intermediate state.")
     parser.add_argument('--n_traj_steps', type=int, default=5,
-                        help="Number of Euler steps T in the sampled denoising trajectory.")
-    parser.add_argument('--traj_lambda', type=float, default=1.0,
-                        help="Weight lambda on the auxiliary trajectory (adjoint) loss.")
+                        help="Number of Euler steps T in the sampled denoising trajectory "
+                             "(deep supervision decodes one step per state).")
+    parser.add_argument('--traj_lambda', type=float, default=0.1,
+                        help="Weight lambda on the deep-supervision gene objective.")
     parser.add_argument('--gene_loss', type=str, default='pearson',
                         choices=['pearson', 'mse'],
-                        help="Terminal-state gene objective: 'pearson' (PCCLoss) or 'mse'.")
+                        help="Gene objective decoded along the trajectory: 'pearson' (PCCLoss) or 'mse'.")
+    parser.add_argument('--traj_step_weights', type=float, nargs='+', default=None,
+                        help="Per-step weights for deep supervision (length = n_traj_steps). "
+                             "If omitted, steps are averaged equally.")
 
     # TRIPLEX model hyperparameters (defaults mirror TRIPLEX config/ST/andersson/TRIPLEX.yaml)
     parser.add_argument('--triplex_emb_dim', type=int, default=512)

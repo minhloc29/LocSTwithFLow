@@ -13,11 +13,14 @@ def pcc_loss(pred, target, eps=1e-8):
     Equivalent to ``1 - corr(pred, target)`` up to the minus sign; minimizing it
     drives the predicted gene-expression vector to be linearly correlated with the
     ground truth (matches the ``pearson_mean`` validation metric).
+
+    Uses ``linalg.vector_norm`` (not the deprecated ``Tensor.norm(dim)``, which
+    returns 0 for leading-dimension-1 inputs on torch >= 2.0).
     """
     pred = pred - pred.mean(-1, keepdim=True)
     target = target - target.mean(-1, keepdim=True)
-    pn = pred / (pred.norm(-1, keepdim=True) + eps)
-    tn = target / (target.norm(-1, keepdim=True) + eps)
+    pn = pred / (torch.linalg.vector_norm(pred, dim=-1, keepdim=True) + eps)
+    tn = target / (torch.linalg.vector_norm(target, dim=-1, keepdim=True) + eps)
     return -(pn * tn).sum(-1).mean()
 
 
