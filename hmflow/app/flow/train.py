@@ -15,10 +15,72 @@ from hmflow.utils import set_random_seed, get_current_time, merge_fold_results
 from hmflow.data.dataset import HESTDatasetPath, MultiHESTDataset, padding_batcher, HESTDataset
 from hmflow.data.normalize_utils import get_normalize_method
 from hmflow.model.denoiser import HFlowDenoiser as Denoiser
+from hmflow.model.denoiser import pcc_loss
 from hmflow.model.hflow_config import HFlowConfig
 from hmflow.flow.interpolant import Interpolant
 from hmflow.app.flow.test import test
 from hmflow.hest_utils.utils import save_pkl
+
+
+def adjoint_train_step(args, diffusier, model, img_features, coords, gene_exp):
+    """CAM-style flow-matching training step.
+
+    Samples ONE denoising trajectory (noise -> data) with T Euler steps, keeps every
+    state x_t and velocity v_t, evaluates a gene objective ONLY at the terminal state,
+    computes the adjoint d(gene_loss)/d(x_t) via autograd for every state, then adds an
+    auxiliary trajectory loss that pushes each velocity toward decreasing gene_loss.
+
+    Returns (loss, fm_loss, traj_loss) where loss = fm_loss + lambda * traj_loss.
+    """
+    B = gene_exp.shape[0]
+    device = gene_exp.device
+    T = args.n_traj_steps
+    shape = gene_exp.shape
+
+    # descending time schedule [1.0 -> t_min], T+1 points -> T steps
+    t_min = 1e-3
+    ts = torch.linspace(1.0, t_min, T + 1, device=device)   # [T+1]
+    dts = ts[:-1] - ts[1:]                                  # [T] positive, descending
+
+    pad_mask = img_features.sum(-1) == 0
+
+    x = diffusier.sample_from_prior(shape, device)          # start at noise (t=1)
+    states, velocities, preds = [], [], []
+
+    for s in range(T):
+        t_s = ts[s].expand(B)                               # [B]
+        pred = model.inference(x, img_features, coords, t_s)[0]   # [B, N, G] data prediction
+        d_t = dts[s].expand(B)
+        v = (pred - x) / (1.0 - t_s[:, None, None].clamp(min=t_min))  # rectified velocity
+        states.append(x)
+        velocities.append(v)
+        preds.append(pred)
+        x = diffusier.denoise(pred, x, t_s, d_t)            # Euler step to smaller t
+
+    # 1) flow-matching loss on the trajectory grid: mean MSE(pred, gt) over steps
+    gt = gene_exp[~pad_mask]
+    fm_loss = torch.stack([p[~pad_mask] for p in preds]).sub(gt).square().mean()
+
+    # 2) terminal gene objective (decode ONLY the terminal state's prediction)
+    y_hat = preds[-1][~pad_mask]
+    y_gt = gt
+    if args.gene_loss == "pearson":
+        gene_loss = pcc_loss(y_hat, y_gt)
+    else:
+        gene_loss = torch.nn.functional.mse_loss(y_hat, y_gt)
+
+    # 3) adjoint: d(gene_loss)/d(each trajectory state), retain the graph
+    adjoints = torch.autograd.grad(
+        gene_loss, states, retain_graph=True, create_graph=False
+    )
+
+    # 4) trajectory loss: push each velocity toward decreasing gene_loss (adjoint detached)
+    traj_loss = torch.zeros((), device=device)
+    for v, a in zip(velocities, adjoints):
+        traj_loss = traj_loss - (v * a.detach()).sum() / v.numel()
+
+    loss = fm_loss + args.traj_lambda * traj_loss
+    return loss, fm_loss, traj_loss
 
 
 def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkpoint_save_dir):
@@ -133,28 +195,36 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
             batch = [x.to(device) for x in batch]
             img_features, coords, gene_exp = batch
 
-            #STEP 1:
-            noisy_exp, t_steps = diffusier.corrupt_exp(gene_exp)
-            # noisy_exp: xt = (1-t)x0 + x1
-            # t_steps: t
-            
-            # STEP 2:
-            pred_exp, loss = model(
-                exp=noisy_exp, 
-                img_features=img_features, 
-                coords=coords, 
-                labels=gene_exp, 
-                t_steps=t_steps
-            )
+            # CAM-style training: sample a trajectory, decode terminal gene objective,
+            # backprop the adjoint trajectory loss + flow-matching loss.
+            optimizer.zero_grad(set_to_none=True)
+            if args.use_adjoint:
+                loss, fm_loss, traj_loss = adjoint_train_step(
+                    args, diffusier, model, img_features, coords, gene_exp
+                )
+            else:
+                # original single-step flow matching
+                noisy_exp, t_steps = diffusier.corrupt_exp(gene_exp)
+                pred_exp, fm_loss = model(
+                    exp=noisy_exp,
+                    img_features=img_features,
+                    coords=coords,
+                    labels=gene_exp,
+                    t_steps=t_steps
+                )
+                traj_loss = torch.zeros_like(fm_loss)
+                loss = fm_loss
 
-            optimizer.zero_grad()
-            model.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
             optimizer.step()
 
             if args.use_wandb and wandb is not None:
-                wandb.log({f"{args.dataset}/Train/{split_id}/loss": loss.cpu().item()})
+                wandb.log({
+                    f"{args.dataset}/Train/{split_id}/loss": loss.cpu().item(),
+                    f"{args.dataset}/Train/{split_id}/fm_loss": fm_loss.cpu().item(),
+                    f"{args.dataset}/Train/{split_id}/traj_loss": (args.traj_lambda * traj_loss).cpu().item(),
+                })
 
             avg_loss += loss.cpu().item()
         
@@ -315,6 +385,18 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='spatial_flow',
                         choices=['spatial_flow', 'triplex'],
                         help="Which model to train: 'spatial_flow' (HFlow/STFlow) or 'triplex'.")
+
+    # CAM-style adjoint / trajectory-loss regularization
+    parser.add_argument('--use_adjoint', type=lambda x: x.lower() in ('true', '1', 'yes'),
+                        default=True,
+                        help="Enable CAM-style trajectory sampling + adjoint trajectory loss.")
+    parser.add_argument('--n_traj_steps', type=int, default=5,
+                        help="Number of Euler steps T in the sampled denoising trajectory.")
+    parser.add_argument('--traj_lambda', type=float, default=1.0,
+                        help="Weight lambda on the auxiliary trajectory (adjoint) loss.")
+    parser.add_argument('--gene_loss', type=str, default='pearson',
+                        choices=['pearson', 'mse'],
+                        help="Terminal-state gene objective: 'pearson' (PCCLoss) or 'mse'.")
 
     # TRIPLEX model hyperparameters (defaults mirror TRIPLEX config/ST/andersson/TRIPLEX.yaml)
     parser.add_argument('--triplex_emb_dim', type=int, default=512)

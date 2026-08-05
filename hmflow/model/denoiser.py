@@ -7,6 +7,20 @@ from hmflow.model.hierarchy import HierarchyEncoder
 from hmflow.model.hflow_block import HFlowBlock
 
 
+def pcc_loss(pred, target, eps=1e-8):
+    """Negative Pearson correlation over the gene axis, averaged over spots.
+
+    Equivalent to ``1 - corr(pred, target)`` up to the minus sign; minimizing it
+    drives the predicted gene-expression vector to be linearly correlated with the
+    ground truth (matches the ``pearson_mean`` validation metric).
+    """
+    pred = pred - pred.mean(-1, keepdim=True)
+    target = target - target.mean(-1, keepdim=True)
+    pn = pred / (pred.norm(-1, keepdim=True) + eps)
+    tn = target / (target.norm(-1, keepdim=True) + eps)
+    return -(pn * tn).sum(-1).mean()
+
+
 class TimestepEmbedder(nn.Module):
     # We want the neural network to know "what time it is" in the diffusion process.
     # Time = 73 not informative -> [0.1, 0.15,...] better
