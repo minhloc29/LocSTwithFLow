@@ -36,6 +36,20 @@ class HFlowConfig:
     lambda_community: float = 0.05  # weight on neighbor-consistency of community logits
     lambda_niche: float = 0.05      # weight on neighbor-consistency of niche embeddings
 
+    # ── Latent flow matching over the biological hierarchy ──
+    # Off by default (gene-space HFlowDenoiser baseline preserved). When enabled,
+    # a LatentFlowDenoiser transports PROGRAM states [N,K] through the flow ODE —
+    # the hierarchy (Program -> Community -> Niche -> Genes) is part of the evolved
+    # state, not a post-hoc decoder. Encoder E: genes->program; decoder D: the L2C
+    # community->niche->genes cascade.
+    use_latent_flow: bool = False
+    n_latent_d_model: int = 128     # hidden dim of the latent-flow backbone/encoder/decoder
+    lambda_lf_flow: float = 1.0     # flow matching loss in program space (MSE)
+    lambda_lf_gene: float = 1.0     # gene reconstruction of decoded endpoint vs gene_gt
+    lambda_lf_ae: float = 0.1       # AE cycle consistency: D(E(gene_gt)) ~ gene_gt
+    lambda_lf_community: float = 0.05  # neighbor smoothness of constructed community
+    lambda_lf_niche: float = 0.05      # neighbor smoothness of constructed niche
+
     def __post_init__(self):
         valid_repr = {"flat", "slide_patch", "slide_region_patch"}
         assert self.hflow_representation in valid_repr, \

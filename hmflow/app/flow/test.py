@@ -131,18 +131,28 @@ def test(args, diffusier, model, loader_list, return_all=False):
             img_features, coords, labels = batch
             assert img_features.shape[0] == 1, "Batch size must be 1 for inference"
 
-            exp_t1 = diffusier.sample_from_prior(labels.shape, labels.device)
+            # Latent flow matching transports PROGRAM states [N,K]; the ODE endpoint and
+            # the sampled prior both live in program space, and genes are decoded at the end.
+            latent = bool(getattr(model, 'n_programs', None)) and getattr(args, 'use_latent_flow', False)
+            K = model.n_programs if latent else labels.shape[-1]
+
+            exp_t1 = diffusier.sample_from_prior(
+                (labels.shape[0], labels.shape[1], K), labels.device)
             ts = torch.linspace(
                 0.01, 1.0, args.n_sample_steps
-            )[:, None].expand(args.n_sample_steps, exp_t1.shape[0]).to(args.device)
+            )[:, None].expand(args.n_sample_steps, labels.shape[0]).to(args.device)
 
             pred = None
 
             for step, (t1, t2) in enumerate(zip(ts[:-1], ts[1:])):
-                pred, hierarchy_state = model.inference(
+                out = model.inference(
                     exp_t1, img_features, coords,
                     t1
                 )
+                if latent:
+                    pred, (genes_lat, sc_lat, sn_lat) = out
+                else:
+                    pred, hierarchy_state = out
                 if has_gate and block0 is not None:
                     gw = getattr(block0, "_last_gate_weights", None)
                     gt = getattr(block0, "_last_gate_t", None)
@@ -158,7 +168,7 @@ def test(args, diffusier, model, loader_list, return_all=False):
                 else:
                     exp_t1 = diffusier.denoise(pred, exp_t1, t1, d_t)
 
-            sample = pred
+            sample = genes_lat if latent else pred
             cur_pred.append(sample.squeeze(0).cpu().numpy())
             cur_gt.append(labels.squeeze(0).cpu().numpy())
             cur_coords.append(coords.squeeze(0).cpu().numpy())

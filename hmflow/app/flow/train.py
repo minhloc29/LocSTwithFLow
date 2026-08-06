@@ -145,8 +145,19 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
         lambda_program=args.lambda_program,
         lambda_community=args.lambda_community,
         lambda_niche=args.lambda_niche,
+        use_latent_flow=args.use_latent_flow,
+        n_latent_d_model=args.n_latent_d_model,
+        lambda_lf_flow=args.lambda_lf_flow,
+        lambda_lf_gene=args.lambda_lf_gene,
+        lambda_lf_ae=args.lambda_lf_ae,
+        lambda_lf_community=args.lambda_lf_community,
+        lambda_lf_niche=args.lambda_lf_niche,
     )
-    model = Denoiser(args, hflow_config=hflow_config).to(device)
+    if getattr(args, 'use_latent_flow', False):
+        from hmflow.model.latent_flow import LatentFlowDenoiser
+        model = LatentFlowDenoiser(args, hflow_config=hflow_config).to(device)
+    else:
+        model = Denoiser(args, hflow_config=hflow_config).to(device)
 
     # ── Complexity accounting for the hierarchical modulation ──
     if hasattr(model, "blocks"):
@@ -184,6 +195,9 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
         normalize=args.prior_sampler != "gaussian",
         device=device,
     )
+    if getattr(args, 'use_latent_flow', False):
+        # Latent-flow model corrupts in *program* space internally; give it the diffusier.
+        model.diffusier = diffusier
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     print("Training")
@@ -215,6 +229,13 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
                     args, diffusier, model, img_features, coords, gene_exp
                 )
                 loss = fm_loss + args.traj_lambda * traj_gene_loss
+            elif getattr(args, 'use_latent_flow', False):
+                # Latent flow matching: corrupt in *program* space and supervise the
+                # program endpoint + AE/gene/hierarchy objectives inside the model.
+                # NOTE: latent-flow corrupts in program space, so reuse the model's own
+                # forward (which calls diffusier.corrupt_exp on E(gene_gt)); the gene_exp
+                # here is only the AE source. See LatentFlowDenoiser.forward.
+                loss = fm_loss
             else:
                 traj_gene_loss = torch.zeros_like(fm_loss)
                 loss = fm_loss
@@ -425,6 +446,24 @@ if __name__ == '__main__':
                         help="Weight on neighbor-consistency of community logits.")
     parser.add_argument('--lambda_niche', type=float, default=0.05,
                         help="Weight on neighbor-consistency of program activations.")
+
+    # Latent flow matching over the biological hierarchy (Program -> Community -> Niche -> Genes)
+    parser.add_argument('--use_latent_flow', type=lambda x: x.lower() in ('true', '1', 'yes'),
+                        default=False,
+                        help="Transport PROGRAM latent states [N,K] through the flow ODE "
+                             "instead of gene vectors; hierarchy is part of the evolved state.")
+    parser.add_argument('--n_latent_d_model', type=int, default=128,
+                        help="Hidden dim of the latent-flow backbone/encoder/decoder.")
+    parser.add_argument('--lambda_lf_flow', type=float, default=1.0,
+                        help="Flow matching loss in program space (MSE endpoint vs clean code).")
+    parser.add_argument('--lambda_lf_gene', type=float, default=1.0,
+                        help="Gene reconstruction of the decoded endpoint vs ground truth.")
+    parser.add_argument('--lambda_lf_ae', type=float, default=0.1,
+                        help="AE cycle consistency: D(E(gene_gt)) ~ gene_gt.")
+    parser.add_argument('--lambda_lf_community', type=float, default=0.05,
+                        help="Neighbor smoothness of the constructed community latent.")
+    parser.add_argument('--lambda_lf_niche', type=float, default=0.05,
+                        help="Neighbor smoothness of the constructed niche latent.")
 
     # TRIPLEX model hyperparameters (defaults mirror TRIPLEX config/ST/andersson/TRIPLEX.yaml)
     parser.add_argument('--triplex_emb_dim', type=int, default=512)
