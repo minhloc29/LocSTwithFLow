@@ -4,7 +4,7 @@ import torch.nn as nn
 
 from hmflow.model.hflow_config import HFlowConfig
 from hmflow.model.hierarchy import HierarchyEncoder
-from hmflow.model.hflow_block import HFlowBlock, ProgramCommunityHead
+from hmflow.model.hflow_block import HFlowBlock
 
 
 def pcc_loss(pred, target, eps=1e-8):
@@ -22,6 +22,84 @@ def pcc_loss(pred, target, eps=1e-8):
     pn = pred / (torch.linalg.vector_norm(pred, dim=-1, keepdim=True) + eps)
     tn = target / (torch.linalg.vector_norm(target, dim=-1, keepdim=True) + eps)
     return -(pn * tn).sum(-1).mean()
+
+
+class ConstructiveStage(nn.Module):
+    """One L2C stage: construct a latent, then fuse it back to refine the embedding.
+
+    ``h_new = h + tanh(gate) * Fusion([h ; latent])``. The gate is zero-initialized
+    (AdaLN-Zero style) so the stage starts as the identity and learns to refine the
+    representation over training. Because every stage re-writes ``h``, the next
+    constructor sees the previous decision — this sequential construct-and-refine
+    loop is what distinguishes L2C from parallel/multitask prediction.
+    """
+
+    def __init__(self, d_model, latent_dim):
+        super().__init__()
+        self.constructor = nn.Sequential(          # h -> latent
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, latent_dim),
+        )
+        self.fusion = nn.Sequential(               # [h ; latent] -> delta on h
+            nn.Linear(d_model + latent_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.gate = nn.Parameter(torch.zeros(1))   # AdaLN-Zero: identity at init
+
+    def forward(self, h):
+        latent = self.constructor(h)
+        delta = self.fusion(torch.cat([h, latent], -1))
+        return latent, h + torch.tanh(self.gate) * delta
+
+
+class ConstructiveDecoder(nn.Module):
+    """Standalone L2C decoder: Program -> Community -> Niche -> Genes.
+
+    Applied ONCE to the final spot embedding (after all HFlowBlocks). Each stage
+    constructs a latent and fuses it back into the representation, so decisions are
+    made sequentially rather than in parallel:
+
+        h  --Program--> sp, h'  --Community--> sc, h'' --Niche--> sn, h''' --Genes
+
+    ``program2gene`` is a shared KxG dictionary so each learned program carries an
+    interpretable gene-loading vector, and ``gene_recon = sp @ program2gene`` gives a
+    supervised low-rank reconstruction that makes programs biologically meaningful.
+    """
+
+    def __init__(self, d_model, n_genes, n_programs, n_communities, n_niches):
+        super().__init__()
+        self.program = ConstructiveStage(d_model, n_programs)
+        self.community = ConstructiveStage(d_model, n_communities)
+        self.niche = ConstructiveStage(d_model, n_niches)
+        # K x G program->gene dictionary (interpretable loadings / L_program).
+        self.program2gene = nn.Parameter(torch.randn(n_programs, n_genes) * 0.05)
+        self.gene_decoder = nn.Sequential(          # fully-refined h''' -> genes
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, n_genes),
+        )
+
+    def forward(self, h):
+        sp, h = self.program(h)                     # [N, K]
+        sc, h = self.community(h)                   # [N, C]
+        sn, h = self.niche(h)                       # [N, n_niches]
+        genes = self.gene_decoder(h)                # [N, G]
+        gene_recon = torch.mm(sp, self.program2gene)  # [N, G] low-rank recon
+        return genes, sp, sc, sn, gene_recon
+
+    @staticmethod
+    def neighbor_smoothness(x_flat, neighbor_indices):
+        """Graph Laplacian smoothness over the k-NN spatial graph via mask-free gather.
+
+        ``x_flat`` [N, D]; ``neighbor_indices`` [N, k] from ``_build_graph`` (self
+        excluded). Returns the mean squared neighbour difference — "neighbours are
+        similar" (same-niche consistency). Padding neighbours are clamped by count.
+        """
+        x_neigh = x_flat[neighbor_indices]          # [N, k, D]
+        diff = (x_neigh - x_flat.unsqueeze(1)).pow(2)  # [N, k, D]
+        return diff.sum(-1).mean()                  # scalar
 
 
 class TimestepEmbedder(nn.Module):
@@ -96,17 +174,24 @@ class HFlowDenoiser(nn.Module):
                     modulation_mode=hflow_config.modulation_mode,
                     gate_mode=hflow_config.gate_mode,
                     gate_hidden=hflow_config.gate_hidden,
-                    use_program_latent=hflow_config.use_program_latent,
-                    n_programs=hflow_config.n_programs,
-                    n_communities=hflow_config.n_communities,
-                    lambda_program=hflow_config.lambda_program,
-                    lambda_community=hflow_config.lambda_community,
-                    lambda_niche=hflow_config.lambda_niche,
                 )
                 for _ in range(model_config.n_layers)
             ])
 
         self.loss_func = nn.MSELoss()
+
+        # ── L2C standalone constructive decoder (optional, gated by config) ──
+        # Applied once to the final spot embedding. Off by default so existing
+        # flow-matching behavior is unchanged.
+        self.constructive_decoder = None
+        if hflow_config.use_program_latent:
+            self.constructive_decoder = ConstructiveDecoder(
+                d_model=self.d_model,
+                n_genes=model_config.n_genes,
+                n_programs=hflow_config.n_programs,
+                n_communities=hflow_config.n_communities,
+                n_niches=hflow_config.n_niches,
+            )
 
         self._last_region_assignment = None
         self._all_block_region_assignments = None
@@ -202,7 +287,6 @@ class HFlowDenoiser(nn.Module):
         curr_z_region = z_region
         curr_z_slide = z_slide
         block_velocities = []
-        latent_returns = []  # (program, community, gene_recon) per block, if enabled
 
         for block in self.blocks:
 
@@ -210,7 +294,7 @@ class HFlowDenoiser(nn.Module):
             curr_z_region = z_region
             curr_z_slide = z_slide
 
-            out = block(
+            velocity_flat, curr_z_patch, curr_z_region, curr_z_slide = block(
                 noisy_exp_flat=noisy_exp_flat,
                 z_patch_flat=curr_z_patch,
                 z_region=curr_z_region,
@@ -223,19 +307,14 @@ class HFlowDenoiser(nn.Module):
                 t=t_steps,
                 t_emb=t_emb,
             )
-            (velocity_flat, curr_z_patch, curr_z_region, curr_z_slide,
-             program_scores, community_probs, gene_recon) = out
             block_velocities.append(velocity_flat)
-            if getattr(block, "use_program_latent", False):
-                latent_returns.append(
-                    (program_scores, community_probs, gene_recon, nearest_indices))
 
         prediction_flat = torch.stack(block_velocities).mean(0)
-      
+
         prediction = prediction_flat.new_zeros(B, N_cells, prediction_flat.shape[-1])
         prediction[~pad_mask] = prediction_flat
 
-    
+
         z_patch_updated = z_patch.new_zeros(B, N_cells, self.d_model)
         z_patch_updated[~pad_mask] = curr_z_patch
         new_hierarchy_state = (z_patch_updated, curr_z_region, curr_z_slide)
@@ -246,7 +325,14 @@ class HFlowDenoiser(nn.Module):
                 b._last_region_assignment for b in self.blocks
             ]
 
-        self._last_latent_returns = latent_returns
+        # ── L2C constructive decoder over the final spot embedding (optional) ──
+        # Decodes genes sequentially (program -> community -> niche -> genes) from the
+        # fully-refined patch token, and exposes the per-stage latents for the
+        # multi-level loss. ``prediction`` remains the block-averaged flow velocity.
+        self._last_latents = None
+        if self.constructive_decoder is not None:
+            genes, sp, sc, sn, gene_recon = self.constructive_decoder(curr_z_patch)
+            self._last_latents = (genes, sp, sc, sn, gene_recon, nearest_indices)
 
         return prediction, new_hierarchy_state
 
@@ -271,42 +357,32 @@ class HFlowDenoiser(nn.Module):
 
         return self._inference_hierarchical(noisy_exp, img_features, coords, t_steps)
 
-    def _multi_level_loss(self, labels_flat, latent_returns):
-        """Sum the auxiliary program/community/niche objectives across blocks.
+    def _multi_level_loss(self, labels_flat, latents):
+        """L2C multi-level objective from the standalone constructive decoder.
 
-        ``latent_returns`` is a list of (program_scores[N,K], community_probs[N,C],
-        gene_recon[N,G], nearest_indices[N,k]) — one entry per latent-enabled block.
+        ``latents`` = (genes[N,G], sp[N,K], sc[N,C], sn[N,n_niches],
+                       gene_recon[N,G], nearest_indices[N,k]).
 
-        Losses (each averaged over blocks):
-          L_program   = MSE(low-rank gene recon, true expression) — makes programs
-                        carry real gene meaning.
-          L_community = neighbor smoothness of community logits (softmax) — adjacent
-                        spots in the same niche tend to share community membership.
-          L_niche     = neighbor smoothness of program activations — adjacent spots
-                        in the same niche tend to have similar program profiles.
+        Losses:
+          L_program   = MSE(low-rank gene recon thru programs, true expression)
+          L_community = neighbor smoothness of the softmax community distribution
+          L_niche     = neighbor smoothness of the niche embedding
         """
-        if not latent_returns:
-            return 0.0
+        _, _, sc, sn, gene_recon, nearest_indices = latents
         w_p = self.hcfg.lambda_program
         w_c = self.hcfg.lambda_community
         w_n = self.hcfg.lambda_niche
-        device = labels_flat.device
-        l_p = torch.tensor(0.0, device=device)
-        l_c = torch.tensor(0.0, device=device)
-        l_n = torch.tensor(0.0, device=device)
-        for program_scores, community_probs, gene_recon, neighbor_indices in latent_returns:
-            l_p = l_p + nn.functional.mse_loss(gene_recon, labels_flat)
-            l_c = l_c + ProgramCommunityHead.neighbor_smoothness(community_probs, neighbor_indices)
-            l_n = l_n + ProgramCommunityHead.neighbor_smoothness(program_scores, neighbor_indices)
-        n = len(latent_returns)
-        return w_p * l_p / n + w_c * l_c / n + w_n * l_n / n
+        l_p = nn.functional.mse_loss(gene_recon, labels_flat)
+        l_c = ConstructiveDecoder.neighbor_smoothness(torch.softmax(sc, dim=-1), nearest_indices)
+        l_n = ConstructiveDecoder.neighbor_smoothness(sn, nearest_indices)
+        return w_p * l_p + w_c * l_c + w_n * l_n
 
     def forward(self, exp, img_features, coords, labels, t_steps):
 
         prediction, _ = self.inference(exp, img_features, coords, t_steps)
         pad_mask = img_features.sum(-1) == 0
         loss = self.loss_func(prediction[~pad_mask], labels[~pad_mask])
-        if self.hcfg.use_program_latent and getattr(self, "_last_latent_returns", None):
+        if self.hcfg.use_program_latent and getattr(self, "_last_latents", None):
             loss = loss + self._multi_level_loss(
-                labels[~pad_mask], self._last_latent_returns)
+                labels[~pad_mask], self._last_latents)
         return prediction, loss

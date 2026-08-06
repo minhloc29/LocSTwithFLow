@@ -141,6 +141,7 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
         use_program_latent=args.use_program_latent,
         n_programs=args.n_programs,
         n_communities=args.n_communities,
+        n_niches=args.n_niches,
         lambda_program=args.lambda_program,
         lambda_community=args.lambda_community,
         lambda_niche=args.lambda_niche,
@@ -416,6 +417,8 @@ if __name__ == '__main__':
                         help="K latent program activations per spot (program head output).")
     parser.add_argument('--n_communities', type=int, default=8,
                         help="C soft community mixing per spot (community head output).")
+    parser.add_argument('--n_niches', type=int, default=16,
+                        help="D latent niche embedding dim per spot (niche stage output).")
     parser.add_argument('--lambda_program', type=float, default=0.1,
                         help="Weight on low-rank gene reconstruction through programs.")
     parser.add_argument('--lambda_community', type=float, default=0.05,

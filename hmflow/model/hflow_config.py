@@ -24,15 +24,17 @@ class HFlowConfig:
 
     # ── Learned gene-program latent (Program → Community → Niche) ──
     # Off by default so existing flow-matching behavior is unchanged. When enabled,
-    # each block predicts a K-dim program activation, a C-dim community mixing with
-    # a low-rank program→gene decoder, and a graph-smoothness regularizer on the
-    # community output over the k-NN spatial graph.
+    # a standalone L2C-style ConstructiveDecoder runs ONCE over the final spot
+    # embedding: each stage constructs a latent (program -> community -> niche) then
+    # fuses it back to refine the representation, ending with a gene decode. Losses:
+    # low-rank gene recon through programs + graph-smoothness on community/niche.
     use_program_latent: bool = False
     n_programs: int = 32            # K latent program activations per spot
     n_communities: int = 8          # C soft communities per spot
+    n_niches: int = 16              # D latent niche embedding dim per spot
     lambda_program: float = 0.1     # weight on low-rank gene reconstruction thru programs
     lambda_community: float = 0.05  # weight on neighbor-consistency of community logits
-    lambda_niche: float = 0.05      # weight on neighbor-consistency of program/niche emb
+    lambda_niche: float = 0.05      # weight on neighbor-consistency of niche embeddings
 
     def __post_init__(self):
         valid_repr = {"flat", "slide_patch", "slide_region_patch"}
