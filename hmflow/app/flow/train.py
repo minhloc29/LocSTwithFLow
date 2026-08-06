@@ -138,6 +138,12 @@ def main(args, split_id, train_sample_ids, test_sample_ids, val_save_dir, checkp
         modulation_mode=args.modulation_mode,
         gate_mode=args.gate_mode,
         gate_hidden=args.gate_hidden,
+        use_program_latent=args.use_program_latent,
+        n_programs=args.n_programs,
+        n_communities=args.n_communities,
+        lambda_program=args.lambda_program,
+        lambda_community=args.lambda_community,
+        lambda_niche=args.lambda_niche,
     )
     model = Denoiser(args, hflow_config=hflow_config).to(device)
 
@@ -400,6 +406,22 @@ if __name__ == '__main__':
     parser.add_argument('--traj_step_weights', type=float, nargs='+', default=None,
                         help="Per-step weights for deep supervision (length = n_traj_steps). "
                              "If omitted, steps are averaged equally.")
+
+    # Learned gene-program latent (Program → Community → Niche), off by default
+    parser.add_argument('--use_program_latent', type=lambda x: x.lower() in ('true', '1', 'yes'),
+                        default=False,
+                        help="Enable learned K-dim gene programs with soft communities, "
+                             "low-rank gene reconstruction and neighbor smoothness.")
+    parser.add_argument('--n_programs', type=int, default=32,
+                        help="K latent program activations per spot (program head output).")
+    parser.add_argument('--n_communities', type=int, default=8,
+                        help="C soft community mixing per spot (community head output).")
+    parser.add_argument('--lambda_program', type=float, default=0.1,
+                        help="Weight on low-rank gene reconstruction through programs.")
+    parser.add_argument('--lambda_community', type=float, default=0.05,
+                        help="Weight on neighbor-consistency of community logits.")
+    parser.add_argument('--lambda_niche', type=float, default=0.05,
+                        help="Weight on neighbor-consistency of program activations.")
 
     # TRIPLEX model hyperparameters (defaults mirror TRIPLEX config/ST/andersson/TRIPLEX.yaml)
     parser.add_argument('--triplex_emb_dim', type=int, default=512)

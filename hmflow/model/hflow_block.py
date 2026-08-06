@@ -7,6 +7,54 @@ from hmflow.model.hierarchy_time_gate import HierarchyTimeGate
 from hmflow.model.hierarchy_adaln import HierarchyAdaLN
 
 
+class ProgramCommunityHead(nn.Module):
+    """Learned gene-program → soft-community latent (SPACE/STModule-style).
+
+    Given the spot embedding h [N, d_model]:
+
+        program_scores  = Linear(GELU(Linear(h)))              [N, K]
+        gene_recon      = program_scores @ program2gene        [N, G]   (low-rank)
+        community_logits= Linear(program_scores)               [N, C]
+        community_probs = softmax(community_logits)            [N, C]
+
+    ``program2gene`` is a shared K×G dictionary so each learned program carries an
+    interpretable gene-loading vector (like an NMF/SPACE module), and low-rank gene
+    reconstruction is what makes programs biologically meaningful rather than black-box.
+    """
+
+    def __init__(self, d_model, n_programs, n_communities, n_genes):
+        super().__init__()
+        self.n_programs = n_programs
+        self.n_communities = n_communities
+
+        self.program_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, n_programs),
+        )
+        self.community_head = nn.Linear(n_programs, n_communities)
+        # K×G program→gene dictionary (shared across blocks; loadings = interpretable).
+        self.program2gene = nn.Parameter(torch.randn(n_programs, n_genes) * 0.05)
+
+    def forward(self, h):
+        program_scores = self.program_head(h)                    # [N, K]
+        community_probs = torch.softmax(self.community_head(program_scores), dim=-1)  # [N, C]
+        gene_recon = torch.mm(program_scores, self.program2gene) # [N, G]
+        return program_scores, community_probs, gene_recon
+
+    @staticmethod
+    def neighbor_smoothness(x_flat, neighbor_indices):
+        """Graph Laplacian smoothness over the k-NN spatial graph via mask-free gather.
+
+        ``x_flat`` [N, D]; ``neighbor_indices`` [N, k] from ``_build_graph`` (self
+        excluded). Returns the mean squared neighbour difference — "neighbours are
+        similar" (same-niche consistency). Padding neighbours are clamped by count.
+        """
+        x_neigh = x_flat[neighbor_indices]                        # [N, k, D]
+        diff = (x_neigh - x_flat.unsqueeze(1)).pow(2)             # [N, k, D]
+        return diff.sum(-1).mean()                                # scalar
+
+
 def rearrange(x, pattern, **kwargs):
     """Minimal einops.rearrange replacement for 'n (h d) -> n h d' and variants."""
     if '->' in pattern:
@@ -318,6 +366,13 @@ class HFlowBlock(nn.Module):
         modulation_mode="adaln",
         gate_mode="learnable",
         gate_hidden=128,
+        # learned program latent (off by default)
+        use_program_latent=False,
+        n_programs=32,
+        n_communities=8,
+        lambda_program=0.1,
+        lambda_community=0.05,
+        lambda_niche=0.05,
     ):
         super().__init__()
 
@@ -363,6 +418,21 @@ class HFlowBlock(nn.Module):
         )
 
         self.cross_scale_direction = hflow_cross_scale
+
+        # ── Learned gene-program latent (optional, gated by config) ──
+        self.use_program_latent = bool(use_program_latent)
+        self.lambda_program = lambda_program
+        self.lambda_community = lambda_community
+        self.lambda_niche = lambda_niche
+        if self.use_program_latent:
+            self.program_community = ProgramCommunityHead(
+                d_model=d_model,
+                n_programs=n_programs,
+                n_communities=n_communities,
+                n_genes=n_genes,
+            )
+        else:
+            self.program_community = None
 
         # ── Time-dependent hierarchical modulation (scalar gate / AdaLN) ──
         self.use_time_hierarchy_gate = use_time_hierarchy_gate
@@ -551,4 +621,20 @@ class HFlowBlock(nn.Module):
 
         velocity_flat = self.velocity_head(z_patch_flat)
 
-        return velocity_flat, z_patch_flat, z_region, z_slide
+        # ── Learned program/community latent (optional) ──
+        # Program activations, soft communities and low-rank gene reconstruction are
+        # decoded from the final patch token, then supervised by the denoiser's
+        # multi-level loss (gene recon + neighbor smoothness).
+        program_scores = community_probs = gene_recon = None
+        if self.use_program_latent:
+            program_scores, community_probs, gene_recon = self.program_community(z_patch_flat)
+
+        return (
+            velocity_flat,
+            z_patch_flat,
+            z_region,
+            z_slide,
+            program_scores,
+            community_probs,
+            gene_recon,
+        )

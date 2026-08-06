@@ -4,7 +4,7 @@ import torch.nn as nn
 
 from hmflow.model.hflow_config import HFlowConfig
 from hmflow.model.hierarchy import HierarchyEncoder
-from hmflow.model.hflow_block import HFlowBlock
+from hmflow.model.hflow_block import HFlowBlock, ProgramCommunityHead
 
 
 def pcc_loss(pred, target, eps=1e-8):
@@ -96,6 +96,12 @@ class HFlowDenoiser(nn.Module):
                     modulation_mode=hflow_config.modulation_mode,
                     gate_mode=hflow_config.gate_mode,
                     gate_hidden=hflow_config.gate_hidden,
+                    use_program_latent=hflow_config.use_program_latent,
+                    n_programs=hflow_config.n_programs,
+                    n_communities=hflow_config.n_communities,
+                    lambda_program=hflow_config.lambda_program,
+                    lambda_community=hflow_config.lambda_community,
+                    lambda_niche=hflow_config.lambda_niche,
                 )
                 for _ in range(model_config.n_layers)
             ])
@@ -196,14 +202,15 @@ class HFlowDenoiser(nn.Module):
         curr_z_region = z_region
         curr_z_slide = z_slide
         block_velocities = []
+        latent_returns = []  # (program, community, gene_recon) per block, if enabled
 
         for block in self.blocks:
-        
+
             curr_z_patch = z_patch_flat
             curr_z_region = z_region
             curr_z_slide = z_slide
 
-            velocity_flat, curr_z_patch, curr_z_region, curr_z_slide = block(
+            out = block(
                 noisy_exp_flat=noisy_exp_flat,
                 z_patch_flat=curr_z_patch,
                 z_region=curr_z_region,
@@ -216,7 +223,12 @@ class HFlowDenoiser(nn.Module):
                 t=t_steps,
                 t_emb=t_emb,
             )
+            (velocity_flat, curr_z_patch, curr_z_region, curr_z_slide,
+             program_scores, community_probs, gene_recon) = out
             block_velocities.append(velocity_flat)
+            if getattr(block, "use_program_latent", False):
+                latent_returns.append(
+                    (program_scores, community_probs, gene_recon, nearest_indices))
 
         prediction_flat = torch.stack(block_velocities).mean(0)
       
@@ -233,6 +245,8 @@ class HFlowDenoiser(nn.Module):
             self._all_block_region_assignments = [
                 b._last_region_assignment for b in self.blocks
             ]
+
+        self._last_latent_returns = latent_returns
 
         return prediction, new_hierarchy_state
 
@@ -257,9 +271,42 @@ class HFlowDenoiser(nn.Module):
 
         return self._inference_hierarchical(noisy_exp, img_features, coords, t_steps)
 
+    def _multi_level_loss(self, labels_flat, latent_returns):
+        """Sum the auxiliary program/community/niche objectives across blocks.
+
+        ``latent_returns`` is a list of (program_scores[N,K], community_probs[N,C],
+        gene_recon[N,G], nearest_indices[N,k]) — one entry per latent-enabled block.
+
+        Losses (each averaged over blocks):
+          L_program   = MSE(low-rank gene recon, true expression) — makes programs
+                        carry real gene meaning.
+          L_community = neighbor smoothness of community logits (softmax) — adjacent
+                        spots in the same niche tend to share community membership.
+          L_niche     = neighbor smoothness of program activations — adjacent spots
+                        in the same niche tend to have similar program profiles.
+        """
+        if not latent_returns:
+            return 0.0
+        w_p = self.hcfg.lambda_program
+        w_c = self.hcfg.lambda_community
+        w_n = self.hcfg.lambda_niche
+        device = labels_flat.device
+        l_p = torch.tensor(0.0, device=device)
+        l_c = torch.tensor(0.0, device=device)
+        l_n = torch.tensor(0.0, device=device)
+        for program_scores, community_probs, gene_recon, neighbor_indices in latent_returns:
+            l_p = l_p + nn.functional.mse_loss(gene_recon, labels_flat)
+            l_c = l_c + ProgramCommunityHead.neighbor_smoothness(community_probs, neighbor_indices)
+            l_n = l_n + ProgramCommunityHead.neighbor_smoothness(program_scores, neighbor_indices)
+        n = len(latent_returns)
+        return w_p * l_p / n + w_c * l_c / n + w_n * l_n / n
+
     def forward(self, exp, img_features, coords, labels, t_steps):
-      
+
         prediction, _ = self.inference(exp, img_features, coords, t_steps)
         pad_mask = img_features.sum(-1) == 0
         loss = self.loss_func(prediction[~pad_mask], labels[~pad_mask])
+        if self.hcfg.use_program_latent and getattr(self, "_last_latent_returns", None):
+            loss = loss + self._multi_level_loss(
+                labels[~pad_mask], self._last_latent_returns)
         return prediction, loss
